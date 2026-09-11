@@ -231,6 +231,24 @@ fi
 # --------------------------------------------------------------------------- #
 LABEL="com.pukerwonderland.codebuddy-dashboard"
 
+# Wait briefly for the dashboard to bind, so the installer's own checks and the
+# user's first browser hit do not race the service restart.
+wait_for_port() {
+  "$PY" - "$HOST" "$PORT" <<'PY' || true
+import socket, sys, time
+host, port = sys.argv[1], int(sys.argv[2])
+target = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+for _ in range(30):
+    try:
+        with socket.create_connection((target, port), timeout=0.4):
+            print(f"port {port} reachable")
+            raise SystemExit(0)
+    except OSError:
+        time.sleep(0.2)
+print(f"port {port} not reachable yet (service may still be starting)")
+PY
+}
+
 install_linux_service() {
   local unit_src="$REPO/systemd/codebuddy-dashboard.service.in"
   local unit_dir="$HOME/.config/systemd/user"
@@ -251,6 +269,7 @@ install_linux_service() {
   systemctl --user enable --now codebuddy-dashboard >/dev/null 2>&1 || \
     warn "could not enable/start; run: systemctl --user status codebuddy-dashboard"
   log "service    : codebuddy-dashboard.service (systemd --user)"
+  wait_for_port
   if command -v loginctl >/dev/null 2>&1; then
     loginctl enable-linger "$USER" >/dev/null 2>&1 || \
       warn "could not enable linger (boot without login needs it)"
@@ -276,6 +295,7 @@ install_macos_service() {
   else
     warn "could not load LaunchAgent; run: launchctl load -w \"$plist\""
   fi
+  wait_for_port
 }
 
 if [ "$NO_SERVICE" = 1 ]; then
