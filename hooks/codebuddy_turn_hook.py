@@ -360,6 +360,7 @@ def analyze_transcript(transcript_path: Any) -> dict[str, Any]:
         "answer": answer,
         "model": model,
         "cumulative": totals,
+        "entries": entries,
     }
 
 
@@ -380,6 +381,170 @@ def hit_rate(usage: dict[str, int]) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# Harness reconstruction (best-effort; explicitly NOT verbatim)
+# --------------------------------------------------------------------------- #
+CONTEXT_FILE_NAMES = ("CODEBUDDY.md", "AGENTS.md")
+BLOCK_PREVIEW = 600
+NOT_PERSISTED = (
+    "系统指令 / instructions 基线",
+    "environment_context（工作目录、git 状态、平台等）",
+    "权限模式与工具白名单的注入文本",
+    "技能（Skills）与插件清单的注入文本",
+    "记忆（memory）注入全文——仅在磁盘文件清单中体现",
+    "实际发送给云端的请求体与完整消息序列（本地日志不保存）",
+)
+
+
+def _reminder_kind(text: str) -> str:
+    match = re.search(r'data-role="([^"]+)"', text)
+    if match:
+        return match.group(1)
+    stripped = text.lstrip()
+    if stripped.startswith("<"):
+        return stripped.split(">", 1)[0][1:].strip() or "system-reminder"
+    return "system-reminder"
+
+
+def injected_blocks(entries: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Non-prompt user messages (injected reminders) belonging to this turn."""
+    real = [
+        index
+        for index, entry in enumerate(entries)
+        if entry.get("type") == "message"
+        and entry.get("role") == "user"
+        and user_prompt_text(entry)
+    ]
+    if not real:
+        return []
+    current = real[-1]
+    previous = real[-2] if len(real) >= 2 else -1
+    blocks: list[tuple[str, str]] = []
+    for entry in entries[previous + 1 : current + 1]:
+        if entry.get("type") != "message" or entry.get("role") != "user":
+            continue
+        text = _block_text(entry, {"input_text", "text"})
+        if not text.strip() or user_prompt_text(entry):
+            continue
+        blocks.append((_reminder_kind(text), text))
+    return blocks
+
+
+def context_file_manifest(cwd: str, transcript_path: Any) -> list[dict[str, Any]]:
+    """Existing context files with size + sha256 (current disk state, not a snapshot)."""
+    candidates: list[Path] = []
+    if cwd:
+        base = Path(cwd)
+        candidates += [base / name for name in CONTEXT_FILE_NAMES]
+    home_cb = Path.home() / ".codebuddy"
+    candidates += [home_cb / name for name in CONTEXT_FILE_NAMES]
+    if transcript_path:
+        memory_dir = Path(str(transcript_path)).parent / "memory"
+        if memory_dir.is_dir():
+            try:
+                candidates += sorted(memory_dir.glob("*.md"))
+            except OSError:
+                pass
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        rows.append(
+            {"path": key, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        )
+    return rows
+
+
+def harness_section(
+    event: dict[str, Any], entries: list[dict[str, Any]], current: dict[str, int]
+) -> str:
+    """Render the reconstructed 'what the model saw at the edges' section."""
+    blocks = injected_blocks(entries)
+    files = context_file_manifest(str(event.get("cwd", "")), event.get("transcript_path"))
+    real_count = sum(
+        1
+        for entry in entries
+        if entry.get("type") == "message"
+        and entry.get("role") == "user"
+        and user_prompt_text(entry)
+    )
+    assistant_count = sum(
+        1
+        for entry in entries
+        if entry.get("type") == "message"
+        and entry.get("role") == "assistant"
+        and assistant_text(entry)
+    )
+
+    out: list[str] = []
+    out.append("## Harness 组装（重建，非逐字）")
+    out.append("")
+    out.append(
+        "> harness 在请求时拼入的完整上下文（系统指令 / instructions / environment_context / "
+        "权限 / 技能 / 记忆 / 全量历史）不会落盘。"
+    )
+    out.append(
+        "> 本节仅依据本地可得证据重建；逐字部分已标注来源，不可得的部分明确列为“未持久化”。"
+    )
+    out.append("")
+    out.append("### 本轮日志中记录的 reminder 块（逐字）")
+    out.append("")
+    out.append(
+        "> 注：会话日志不区分“注入给模型的上下文块”与“仅显示给用户的提示”（如 hook 的 systemMessage），"
+        "以下按原文列出，供对照。"
+    )
+    out.append("")
+    if blocks:
+        for index, (kind, text) in enumerate(blocks, 1):
+            body = (
+                text
+                if len(text) <= BLOCK_PREVIEW
+                else text[:BLOCK_PREVIEW] + f"\n…（共 {len(text)} 字符，已截断）"
+            )
+            out.append(f"**{index}. `{kind}`**")
+            out.append("")
+            out.append("```text")
+            out.append(body)
+            out.append("```")
+            out.append("")
+    else:
+        out.append("（会话日志中未记录到本轮注入的 reminder 块）")
+        out.append("")
+    out.append("### 引用的上下文文件（磁盘当前版本，非请求时快照）")
+    out.append("")
+    if files:
+        for row in files:
+            out.append(f"- `{row['path']}` — {row['bytes']} B, sha256={row['sha256']}")
+    else:
+        out.append("（未发现 CODEBUDDY.md / AGENTS.md / memory 文件）")
+    out.append("")
+    out.append("### 历史规模")
+    out.append("")
+    out.append(
+        f"- 截至本轮：用户消息 {real_count} 条 · assistant 消息 {assistant_count} 条 · "
+        f"累计 tokens {int(current.get('total', 0)):,}"
+    )
+    out.append(
+        f"- 其中输入 {int(current.get('input', 0)):,}（缓存命中 {int(current.get('cache_hit', 0)):,}）"
+        f" · 输出 {int(current.get('output', 0)):,}"
+    )
+    out.append("")
+    out.append("### 未持久化（不可得）")
+    out.append("")
+    for item in NOT_PERSISTED:
+        out.append(f"- {item}")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
 # Archive writing
 # --------------------------------------------------------------------------- #
 def markdown_document(
@@ -387,6 +552,7 @@ def markdown_document(
     prompt: str,
     session_record: dict[str, Any],
     answer: str,
+    harness: str = "",
 ) -> bytes:
     created_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     header = (
@@ -402,13 +568,19 @@ def markdown_document(
         f"assistant_answer_bytes: {len(answer.encode('utf-8'))}\n"
         f"assistant_answer_sha256: {sha256_text(answer)}\n"
         "archive_mode: verbatim\n"
+        f"harness_section: {'reconstructed' if harness else 'absent'}\n"
         "---\n\n"
         "# CodeBuddy 对话归档\n\n"
         "## 用户原文\n\n"
     )
     middle = "\n\n## CodeBuddy 最终回答\n\n"
-    # The two payloads are inserted unchanged; only the envelope is generated.
-    return (header + prompt + middle + answer + "\n").encode("utf-8")
+    # The prompt and answer payloads are inserted unchanged; the harness section
+    # (when present) is clearly marked as a reconstruction, not verbatim.
+    body = header + prompt
+    if harness:
+        body += "\n\n" + harness.rstrip() + "\n"
+    body += middle + answer + "\n"
+    return body.encode("utf-8")
 
 
 def same_prefix(source: Path, destination: Path, destination_size: int) -> bool:
@@ -466,6 +638,7 @@ def write_archive(
     session_record: dict[str, Any],
     prompt: str,
     answer: str,
+    harness: str = "",
 ) -> str:
     """Write the Markdown + audit mirror. Returns the archive-relative path."""
     date = safe_id(session_record.get("date"), "unknown-date")
@@ -478,7 +651,9 @@ def write_archive(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as lock:
         exclusive_lock(lock)
-        atomic_write_bytes(turn_file, markdown_document(event, prompt, session_record, answer))
+        atomic_write_bytes(
+            turn_file, markdown_document(event, prompt, session_record, answer, harness)
+        )
         mirror_transcript(event.get("transcript_path"), audit_file)
     return str(turn_file)
 
@@ -568,8 +743,9 @@ def handle_stop(event: dict[str, Any], session_id: str, turn_id: str) -> str:
     archive_status = "未归档"
     if answer:
         try:
+            harness = harness_section(event, analysis.get("entries", []), current)
             relative = write_archive(
-                event, session_id, turn_id, session_record, prompt, answer
+                event, session_id, turn_id, session_record, prompt, answer, harness
             )
             archive_status = f"已归档 → {relative}"
         except Exception as exc:  # noqa: BLE001 - archive failures are non-fatal

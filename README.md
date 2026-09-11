@@ -113,9 +113,25 @@ The config file lives at `~/.codebuddy-usage/config.json` (relocatable via
 
 ```
 <archive_root>/<date>/<title>__<session8>/
-├── 阅读层/<turn-id>.md     # prompt + final answer, verbatim, SHA-256
+├── 阅读层/<turn-id>.md     # prompt + rebuilt Harness section + final answer
 └── 审计层/<session-id>.jsonl   # raw session log mirror
 ```
+
+### About the "Harness assembly (reconstructed)" section
+
+The fully assembled request context (system instructions, AGENTS.md,
+environment_context, permissions, skills, memory, full history) is **not
+persisted locally**: session logs only store conversation events, `traces/`
+holds timing spans only, and `CODEBUDDY_DEBUG_REQUEST` truncates each message to
+500 characters.
+
+That section is therefore a **reconstruction, not verbatim**, and states so:
+recorded reminder blocks, a manifest of referenced context files (path, size,
+SHA-256, current disk state), history scale, and an explicit list of what is
+**not recoverable**. The frontmatter marks it `harness_section: reconstructed`.
+
+Byte-exact capture would require intercepting HTTPS (CodeBuddy honors
+`HTTPS_PROXY`), which is an optional, heavier add-on.
 
 ## Uninstall
 

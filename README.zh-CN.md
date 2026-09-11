@@ -97,9 +97,21 @@ journalctl --user -u codebuddy-dashboard -f
 
 ```
 <archive_root>/<日期>/<标题>__<会话前8位>/
-├── 阅读层/<轮次ID>.md     # 用户原文 + 最终回答，verbatim，含 SHA-256
+├── 阅读层/<轮次ID>.md     # 用户原文 + Harness 组装(重建) + 最终回答
 └── 审计层/<会话ID>.jsonl   # 原始会话日志镜像
 ```
+
+### 关于「Harness 组装（重建）」
+
+harness 在请求时拼入的完整上下文（系统指令 / instructions / environment_context / 权限 / 技能 / 记忆 / 全量历史）**本地不落盘**：会话日志只保存会话事件，`traces/` 只有时序 span，`CODEBUDDY_DEBUG_REQUEST` 也会把每条 message 截断到 500 字符。
+
+因此阅读层中的这一节是**重建而非逐字**，明确包含：
+- **本轮日志中记录的 reminder 块**（逐字，来自会话日志；日志不区分“注入给模型”与“仅显示给用户”）
+- **引用的上下文文件清单**（`CODEBUDDY.md` / `AGENTS.md` / `memory/*.md` 的路径、大小、SHA-256；是**磁盘当前版本**，不是请求时快照）
+- **历史规模**（消息数、累计 tokens / 缓存命中）
+- **未持久化（不可得）清单**，逐项列出哪些内容无法从本地恢复
+
+frontmatter 里以 `harness_section: reconstructed` 标注该节性质。若需要**逐字完整请求**，只能通过本地 HTTPS 代理截获（CodeBuddy 支持 `HTTPS_PROXY`），属于可选的额外工程。
 
 ## 卸载
 
