@@ -286,7 +286,11 @@ install_macos_service() {
       -e "s|__LOG__|$log_dir|g" \
       "$plist_src" > "$plist"
   launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
-  if launchctl bootstrap "gui/$UID" "$plist" >/dev/null 2>&1; then
+  sleep 1
+  # bootstrap can transiently fail right after bootout; retry once, then fall
+  # back to the legacy loader.
+  if launchctl bootstrap "gui/$UID" "$plist" >/dev/null 2>&1 \
+     || { sleep 1; launchctl bootstrap "gui/$UID" "$plist" >/dev/null 2>&1; }; then
     launchctl enable "gui/$UID/$LABEL" >/dev/null 2>&1 || true
     launchctl kickstart -k "gui/$UID/$LABEL" >/dev/null 2>&1 || true
     log "service    : $LABEL (launchd, gui/$UID)"
