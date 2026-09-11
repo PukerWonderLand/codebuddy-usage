@@ -123,6 +123,10 @@ To change paths after install, edit the config file (or pass flags to
 - **`systemd user session unavailable`**: use `--no-service` and run
   `codebuddy-dashboard run` under your own supervisor.
 - **Service stops after logout**: `loginctl enable-linger "$USER"`.
+- **CodeBuddy says "Authentication required. Please use /login"**: the CodeBuddy
+  CLI is not signed in. Run `codebuddy` interactively and use the `/login`
+  command. Neither the hook nor the dashboard produces data until a CodeBuddy
+  turn actually completes.
 - **No archive files after a turn**: the hook only archives when the session
   JSONL already contains the final assistant message; check
   `~/.codebuddy-turn-state/errors.log` and confirm the archive root is writable

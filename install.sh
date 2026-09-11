@@ -308,4 +308,9 @@ fi
 [ -n "${LAN_IP:-}" ] && log "  LAN       : http://$LAN_IP:$PORT/"
 log "  summary   : codebuddy-dashboard summary"
 log "  usage     : codebuddy-usage [latest|summary|json]"
-log "  restart   : systemctl --user restart codebuddy-dashboard"
+if [ "$OS_NAME" = "Darwin" ]; then
+  log "  restart   : launchctl kickstart -k gui/$UID/$LABEL"
+  log "  logs      : tail -f ~/Library/Logs/codebuddy-dashboard.err.log"
+else
+  log "  restart   : systemctl --user restart codebuddy-dashboard"
+fi
