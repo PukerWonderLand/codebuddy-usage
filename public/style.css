@@ -1,0 +1,150 @@
+:root {
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --panel-2: #f0f2f5;
+  --text: #1c1e21;
+  --muted: #6b7280;
+  --border: #e2e5ea;
+  --accent: #2563eb;
+  --accent-2: #0ea5e9;
+  --good: #16a34a;
+  --warn: #d97706;
+  --bar: #3b82f6;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.08);
+}
+
+body.dark {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1e222b;
+  --text: #e6e8ec;
+  --muted: #9aa3b2;
+  --border: #2a2f3a;
+  --accent: #60a5fa;
+  --accent-2: #38bdf8;
+  --good: #4ade80;
+  --warn: #fbbf24;
+  --bar: #60a5fa;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+}
+
+header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 20px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  box-shadow: var(--shadow);
+}
+
+h1 { font-size: 17px; margin: 0; }
+h1 span { color: var(--accent); }
+.sub { color: var(--muted); font-size: 12px; }
+
+.spacer { flex: 1; }
+
+button, select {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 11px;
+  font: inherit;
+  cursor: pointer;
+}
+button:hover, select:hover { border-color: var(--accent); }
+button.active { border-color: var(--accent); color: var(--accent); }
+
+main { padding: 18px 20px 40px; max-width: 1400px; margin: 0 auto; }
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  box-shadow: var(--shadow);
+}
+.card .k { color: var(--muted); font-size: 12px; }
+.card .v { font-size: 22px; font-weight: 650; margin-top: 4px; }
+.card .s { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+.grid { display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel > h2 {
+  font-size: 13px;
+  margin: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 600;
+}
+.panel > .body { padding: 12px 14px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: right; padding: 6px 8px; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th {
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+}
+tbody tr { cursor: default; }
+tbody tr.clickable { cursor: pointer; }
+tbody tr:hover { background: var(--panel-2); }
+tbody tr.sel { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.wrap { max-height: 420px; overflow: auto; }
+
+.bars { display: flex; align-items: flex-end; gap: 4px; height: 160px; padding-top: 8px; }
+.bars .col { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; min-width: 0; }
+.bars .bar { width: 70%; background: var(--bar); border-radius: 3px 3px 0 0; min-height: 2px; }
+.bars .lbl { font-size: 10px; color: var(--muted); margin-top: 4px; transform: rotate(-45deg); white-space: nowrap; }
+
+.pill { padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); color: var(--muted); }
+.pill.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, transparent); }
+
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.muted { color: var(--muted); }
+.right { text-align: right; }
+.loading { color: var(--muted); padding: 20px; text-align: center; }
+.err { color: #dc2626; padding: 12px 14px; }
+
+#toast {
+  position: fixed; right: 16px; bottom: 16px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 12px; box-shadow: var(--shadow);
+  font-size: 12px; opacity: 0; transition: opacity .25s; pointer-events: none;
+}
+#toast.show { opacity: 1; }

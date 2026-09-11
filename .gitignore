@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local runtime / data (never commit real usage or archives)
+config.json
+.codex-usage/
+*.log
+*.bak-*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

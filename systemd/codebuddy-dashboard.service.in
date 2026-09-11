@@ -1,0 +1,13 @@
+[Unit]
+Description=CodeBuddy Usage LAN Dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO__
+ExecStart=__PYTHON__ __REPO__/src/cli.py run --host __HOST__ --port __PORT__
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

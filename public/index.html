@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CodeBuddy 用量仪表盘</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>CodeBuddy <span>用量仪表盘</span></h1>
+    <div class="sub">数据更新：<span id="generated">-</span></div>
+    <div class="spacer"></div>
+    <div>
+      <button data-range="today">今日</button>
+      <button data-range="7d">近 7 天</button>
+      <button data-range="30d">近 30 天</button>
+      <button data-range="all" class="active">全部</button>
+    </div>
+    <button id="refresh">刷新</button>
+    <button id="auto">自动刷新</button>
+    <button id="theme">主题</button>
+  </header>
+
+  <main>
+    <div class="cards" id="cards"></div>
+
+    <div class="panel" style="margin-bottom:16px">
+      <h2>每日总量 (tokens)</h2>
+      <div class="body"><div id="trend"></div></div>
+    </div>
+
+    <div class="grid" style="margin-bottom:16px">
+      <div class="panel">
+        <h2>按模型</h2>
+        <div class="body"><div id="by-model"></div></div>
+      </div>
+      <div class="panel">
+        <h2>按项目</h2>
+        <div class="body"><div id="by-project"></div></div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:16px">
+      <h2>会话</h2>
+      <div class="body"><div id="sessions"></div></div>
+    </div>
+
+    <div class="panel" id="turns-panel" style="margin-bottom:16px; display:none">
+      <h2 id="turns-title">轮次明细</h2>
+      <div class="body"><div id="turns"></div></div>
+    </div>
+
+    <div class="panel">
+      <h2>归档记录 (hooks 账本)</h2>
+      <div class="body"><div id="archive"></div></div>
+    </div>
+  </main>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
