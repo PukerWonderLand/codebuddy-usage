@@ -126,8 +126,11 @@ The config file lives at `~/.codebuddy-usage/config.json` (relocatable via
 
 ## Requirements
 
-- Python 3.10+
-- Linux (systemd optional; otherwise run `codebuddy-dashboard run`)
+- Python 3.10+ (macOS system Python is 3.9 — install 3.10+ via `brew` or
+  `uv python install`)
+- Linux **or** macOS. The service runs as systemd `--user` on Linux and as a
+  launchd LaunchAgent (`com.pukerwonderland.codebuddy-dashboard`) on macOS.
+  Without either, run `codebuddy-dashboard run` yourself.
 - A writable archive directory (SMB/NFS mounts are fine)
 
 ## For AI agents

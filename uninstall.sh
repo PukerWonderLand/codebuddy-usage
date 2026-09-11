@@ -39,9 +39,18 @@ command -v python3 >/dev/null 2>&1 || { warn "python3 not found"; exit 1; }
 PY="$(command -v python3)"
 
 # --------------------------------------------------------------------------- #
-# 1. systemd user service
+# 1. background service (systemd --user on Linux, launchd on macOS)
 # --------------------------------------------------------------------------- #
-if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+if [ "$(uname -s)" = "Darwin" ]; then
+  LABEL="com.pukerwonderland.codebuddy-dashboard"
+  PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+  if [ -f "$PLIST" ]; then
+    run launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+    run launchctl unload -w "$PLIST" >/dev/null 2>&1 || true
+    run rm -f "$PLIST"
+    log "service removed"
+  fi
+elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
   run systemctl --user disable --now codebuddy-dashboard >/dev/null 2>&1 || true
   run rm -f "$HOME/.config/systemd/user/codebuddy-dashboard.service"
   run systemctl --user daemon-reload || true

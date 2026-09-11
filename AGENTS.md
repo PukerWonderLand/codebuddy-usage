@@ -6,7 +6,11 @@ plus per-turn Markdown archiving, with no manual editing of source files.
 
 ## 1. Preconditions
 
-- Linux with `bash`, `git`, and **Python 3.10+** (`python3 --version`).
+- **Linux or macOS**, with `bash`, `git`, and **Python 3.10+**
+  (`python3 --version`). macOS ships 3.9, so install a newer interpreter first,
+  e.g. `brew install python@3.12` or `uv python install 3.12`; the installer
+  probes `python3.13`/`python3.12`/`python3.11`/`python3.10` automatically, or
+  you can pass `PYTHON=/path/to/python3`.
 - The CodeBuddy CLI is installed and has produced at least one session under
   `~/.codebuddy/projects/` (optional; the dashboard also works before that).
 - Decide the archive root:
@@ -44,8 +48,12 @@ Useful flags: `--dry-run`, `--copy`, `--no-hooks`, `--no-service`.
 python3 -m py_compile hooks/codebuddy_turn_hook.py src/*.py && echo COMPILE_OK
 
 # b) The service is up and listening
+ss -ltn | grep 3766            # Linux
+lsof -nP -iTCP:3766 -sTCP:LISTEN   # macOS
+# Linux service state:
 systemctl --user status codebuddy-dashboard --no-pager | head -5
-ss -ltn | grep 3766
+# macOS service state:
+launchctl print "gui/$(id -u)/com.pukerwonderland.codebuddy-dashboard" | head -20
 
 # c) APIs answer
 curl -s http://127.0.0.1:3766/api/health
@@ -105,7 +113,13 @@ To change paths after install, edit the config file (or pass flags to
 ## 6. Troubleshooting
 
 - **Dashboard not reachable from another machine**: confirm it binds `0.0.0.0`
-  (`ss -ltn | grep 3766`) and open the host firewall for that port.
+  (`ss -ltn | grep 3766` on Linux, `lsof -nP -iTCP:3766` on macOS) and open the
+  host firewall for that port. On macOS the first bind triggers a firewall prompt
+  ("Do you want the application python3 to accept incoming network connections?")
+  — allow it, or LAN access stays blocked.
+- **macOS: service not running after install**: `launchctl print gui/$(id -u)/com.pukerwonderland.codebuddy-dashboard`;
+  re-apply with `launchctl bootout gui/$(id -u)/com.pukerwonderland.codebuddy-dashboard` then
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pukerwonderland.codebuddy-dashboard.plist`.
 - **`systemd user session unavailable`**: use `--no-service` and run
   `codebuddy-dashboard run` under your own supervisor.
 - **Service stops after logout**: `loginctl enable-linger "$USER"`.

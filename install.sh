@@ -58,10 +58,25 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-command -v python3 >/dev/null 2>&1 || die "python3 not found; install Python 3.10+"
-PY="$(command -v python3)"
-"$PY" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
-  || die "python3 >= 3.10 required (found $("$PY" --version 2>&1))"
+OS_NAME="$(uname -s)"
+
+# Find a Python >= 3.10. Try the canonical `python3` first (keeps hook commands
+# stable across re-installs); fall back to versioned names, which is what macOS
+# needs because its system `python3` is 3.9.
+find_python() {
+  for cand in ${PYTHON:-} python3 python3.13 python3.12 python3.11 python3.10; do
+    [ -n "$cand" ] || continue
+    p="$(command -v "$cand" 2>/dev/null || true)"
+    [ -n "$p" ] || continue
+    if "$p" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+PY="$(find_python)" || die "Python >= 3.10 required. Install one (e.g. 'brew install python@3.12' or 'uv python install 3.12') and re-run, or set PYTHON=/path/to/python3."
 
 CONFIG_DIR="$HOME/.codebuddy-usage"
 CONFIG="$CONFIG_DIR/config.json"
@@ -171,14 +186,22 @@ for event in ("UserPromptSubmit", "Stop"):
     if not isinstance(groups, list):
         groups = []
         hooks[event] = groups
-    exists = False
+    # Identify our entry by script name, not the full command, so an interpreter
+    # path change updates in place instead of adding a duplicate.
+    found = False
     for group in groups:
         if not isinstance(group, dict):
             continue
         for hook in group.get("hooks", []):
-            if isinstance(hook, dict) and hook.get("command") == command:
-                exists = True
-    if not exists:
+            if isinstance(hook, dict) and "codebuddy_turn_hook.py" in str(hook.get("command", "")):
+                if hook.get("command") != command:
+                    hook["command"] = command
+                    changed = True
+                found = True
+                break
+        if found:
+            break
+    if not found:
         groups.append(
             {
                 "hooks": [
@@ -204,38 +227,65 @@ PY
 fi
 
 # --------------------------------------------------------------------------- #
-# 5. systemd user service
+# 5. background service (systemd --user on Linux, launchd on macOS)
 # --------------------------------------------------------------------------- #
-UNIT_SRC="$REPO/systemd/codebuddy-dashboard.service.in"
-UNIT_DIR="$HOME/.config/systemd/user"
-UNIT="$UNIT_DIR/codebuddy-dashboard.service"
+LABEL="com.pukerwonderland.codebuddy-dashboard"
+
+install_linux_service() {
+  local unit_src="$REPO/systemd/codebuddy-dashboard.service.in"
+  local unit_dir="$HOME/.config/systemd/user"
+  local unit="$unit_dir/codebuddy-dashboard.service"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl not found; start manually: codebuddy-dashboard run --host $HOST --port $PORT"
+    return 0
+  fi
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    warn "systemd user session unavailable; start manually: codebuddy-dashboard run --host $HOST --port $PORT"
+    return 0
+  fi
+  mkdir -p "$unit_dir"
+  sed -e "s|__REPO__|$REPO|g" -e "s|__PYTHON__|$PY|g" \
+      -e "s|__HOST__|$HOST|g" -e "s|__PORT__|$PORT|g" \
+      "$unit_src" > "$unit"
+  systemctl --user daemon-reload
+  systemctl --user enable --now codebuddy-dashboard >/dev/null 2>&1 || \
+    warn "could not enable/start; run: systemctl --user status codebuddy-dashboard"
+  log "service    : codebuddy-dashboard.service (systemd --user)"
+  if command -v loginctl >/dev/null 2>&1; then
+    loginctl enable-linger "$USER" >/dev/null 2>&1 || \
+      warn "could not enable linger (boot without login needs it)"
+  fi
+}
+
+install_macos_service() {
+  local plist_src="$REPO/launchd/$LABEL.plist.in"
+  local plist="$HOME/Library/LaunchAgents/$LABEL.plist"
+  local log_dir="$HOME/Library/Logs"
+  mkdir -p "$HOME/Library/LaunchAgents" "$log_dir"
+  sed -e "s|__REPO__|$REPO|g" -e "s|__PYTHON__|$PY|g" \
+      -e "s|__HOST__|$HOST|g" -e "s|__PORT__|$PORT|g" \
+      -e "s|__LOG__|$log_dir|g" \
+      "$plist_src" > "$plist"
+  launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$UID" "$plist" >/dev/null 2>&1; then
+    launchctl enable "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+    launchctl kickstart -k "gui/$UID/$LABEL" >/dev/null 2>&1 || true
+    log "service    : $LABEL (launchd, gui/$UID)"
+  elif launchctl load -w "$plist" >/dev/null 2>&1; then
+    log "service    : $LABEL (launchd, legacy load)"
+  else
+    warn "could not load LaunchAgent; run: launchctl load -w \"$plist\""
+  fi
+}
 
 if [ "$NO_SERVICE" = 1 ]; then
   log "service    : skipped (--no-service)"
-elif ! command -v systemctl >/dev/null 2>&1; then
-  warn "systemctl not found; start manually: codebuddy-dashboard run --host $HOST --port $PORT"
-elif ! systemctl --user show-environment >/dev/null 2>&1; then
-  warn "systemd user session unavailable; start manually: codebuddy-dashboard run --host $HOST --port $PORT"
+elif [ "$DRY_RUN" = 1 ]; then
+  log "[dry-run] install and start background service for $OS_NAME ($HOST:$PORT)"
+elif [ "$OS_NAME" = "Darwin" ]; then
+  install_macos_service
 else
-  if [ "$DRY_RUN" = 1 ]; then
-    log "[dry-run] install $UNIT and enable --now codebuddy-dashboard"
-  else
-    mkdir -p "$UNIT_DIR"
-    sed -e "s|__REPO__|$REPO|g" \
-        -e "s|__PYTHON__|$PY|g" \
-        -e "s|__HOST__|$HOST|g" \
-        -e "s|__PORT__|$PORT|g" \
-        "$UNIT_SRC" > "$UNIT"
-    systemctl --user daemon-reload
-    systemctl --user enable --now codebuddy-dashboard >/dev/null 2>&1 || \
-      warn "could not enable/start the service; run: systemctl --user status codebuddy-dashboard"
-    log "service    : codebuddy-dashboard.service (systemd --user)"
-    # Linger keeps the service running without an interactive login.
-    if command -v loginctl >/dev/null 2>&1; then
-      loginctl enable-linger "$USER" >/dev/null 2>&1 || \
-        warn "could not enable linger (boot without login needs it)"
-    fi
-  fi
+  install_linux_service
 fi
 
 # --------------------------------------------------------------------------- #
@@ -250,7 +300,11 @@ if [ "$DRY_RUN" = 0 ]; then
 fi
 log "done."
 log "  dashboard : http://$HOST:$PORT/"
-LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+LAN_IP=""
+if command -v ipconfig >/dev/null 2>&1; then
+  LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+fi
+[ -n "${LAN_IP:-}" ] || LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 [ -n "${LAN_IP:-}" ] && log "  LAN       : http://$LAN_IP:$PORT/"
 log "  summary   : codebuddy-dashboard summary"
 log "  usage     : codebuddy-usage [latest|summary|json]"

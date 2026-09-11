@@ -110,8 +110,8 @@ journalctl --user -u codebuddy-dashboard -f
 
 ## 环境要求
 
-- Python 3.10+
-- Linux（systemd 可选；没有 systemd 可用 `codebuddy-dashboard run` 手动启动）
+- Python 3.10+（macOS 自带的是 3.9，需用 `brew` 或 `uv python install` 装 3.10+）
+- Linux **或** macOS。后台服务在 Linux 上用 systemd `--user`，在 macOS 上用 launchd LaunchAgent（`com.pukerwonderland.codebuddy-dashboard`）；两者都没有时用 `codebuddy-dashboard run` 手动启动
 - 归档写入的目录需可写（SMB/NFS 挂载亦可）
 
 ## 给 AI 代理
@@ -136,7 +136,8 @@ codebuddy-usage/
 │   ├── cli.py                    # dashboard CLI
 │   └── viewer.py                 # 账本查看 CLI
 ├── public/                       # 前端（零外部依赖）
-└── systemd/codebuddy-dashboard.service.in
+├── systemd/codebuddy-dashboard.service.in                     # Linux 服务模板
+└── launchd/com.pukerwonderland.codebuddy-dashboard.plist.in   # macOS 服务模板
 ```
 
 ## License
