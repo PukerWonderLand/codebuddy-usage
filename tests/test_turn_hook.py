@@ -251,7 +251,7 @@ def d_pending_question_superseded(check: Checker, box: Sandbox) -> None:
     check.check("signals cleared", box.signals(), [])
     check.check("ledger status", box.ledger()[-1]["turn_status"], "interrupted_pending_question")
     check.check("ledger explains itself", box.ledger()[-1]["archive"],
-                "未归档（回合未真正结束：interrupted_pending_question，仅记账）")
+                "未归档（interrupted_pending_question，仅记账）")
 
 
 def e_cut_off_stream(check: Checker, box: Sandbox) -> None:
@@ -428,6 +428,73 @@ def k_hostile(check: Checker, box: Sandbox) -> None:
     check.check("errors.log", box.errors(), "无")
 
 
+def l_stop_event_wins_over_a_lagging_log(check: Checker, box: Sandbox) -> None:
+    check.section("L. a lagging session log cannot truncate the answer")
+    # Real case: the log still showed the mid-turn note ("先确认两处细节") when the
+    # Stop hook read it, while the actual answer (a 7.5 KB checklist) arrived a beat
+    # later — the archive recorded 184 bytes of narration as the final answer.
+    # The Stop event carries the CLI's own final output, so it must win.
+    full_answer = "最后两块也确认了。现在给你完整清单。\n\n" + "| 表 | 作用 |\n| --- | --- |\n" * 20
+    box.write_transcript([
+        user("配置转发要配哪些东西？", 1),
+        assistant("这个问题正好把前面所有核实串成一份清单。先确认最后两处细节，再给清单。", 2)])
+    box.fire(box.prompt("配置转发要配哪些东西？"))
+    box.fire(box.event("Stop", stop_hook_active=False, last_assistant_message=full_answer))
+    check.check("archive holds the event's full answer",
+                full_answer in box.read("阅读层/" + box.layer("阅读层")[0]), True)
+    recorded = int([l.split(":")[1] for l in box.read("阅读层/" + box.layer("阅读层")[0]).splitlines()
+                    if l.startswith("assistant_answer_bytes")][0])
+    check.check("recorded answer length", recorded, len(full_answer.encode()))
+    check.check("mid-turn note is not the answer",
+                "先确认最后两处细节" in box.read("阅读层/" + box.layer("阅读层")[0]), False)
+
+
+def m_user_interruption_is_not_an_answer(check: Checker, box: Sandbox) -> None:
+    check.section("M. a turn cut off by the user is not archived as an answer")
+    # CodeBuddy still fires Stop when the user interrupts, and the turn's last text
+    # is the 19-byte placeholder "Interrupted by user": it used to be archived as
+    # the final answer of the turn.
+    box.write_transcript([
+        user("帮我查一下", 1),
+        assistant("你的直觉值得认真查。我去 FPGA 代码里找谁发出配置事务。", 2),
+        assistant("Interrupted by user", 3, status="incomplete")])
+    box.fire(box.prompt("帮我查一下"))
+    rc, out, _ = box.fire(box.event("Stop", stop_hook_active=False,
+                                    last_assistant_message="Interrupted by user"))
+    check.check("exit code", rc, 0)
+    check.check("no archive document", box.layer("阅读层"), [])
+    check.check("ledger status", box.ledger()[-1]["turn_status"], "interrupted_by_user")
+    check.check("ledger explains the skip", box.ledger()[-1]["archive"],
+                "未归档（interrupted_by_user，仅记账）")
+    check.check("Stop message still reports the turn",
+                out["systemMessage"].splitlines()[0].startswith("■ 本轮结束"), True)
+
+
+def n_no_double_processing(check: Checker, box: Sandbox) -> None:
+    check.section("N. a prompt landing right after the Stop does not redo the turn")
+    box.write_transcript([
+        user("第一轮", 1),
+        assistant("结论：一切正常。", 2, {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110})])
+    box.fire(box.prompt("第一轮"))
+    turn = box.ledger()[-1]["turn_id"] if box.ledger() else ""
+    box.fire(box.stop("结论：一切正常。"))
+    check.check("archived by the real Stop", len(box.layer("阅读层")), 1)
+    recorded = box.read("阅读层/" + box.layer("阅读层")[0])
+    check.check("marked as a real completion", "recovered: false" in recorded, True)
+    # the session record still names the turn, as happens when the next prompt
+    # arrives in the same instant as the Stop
+    state = json.loads((box.root / "state" / "sessions" / f"{SID}.json").read_text(encoding="utf-8"))
+    state["current_turn_id"] = turn
+    (box.root / "state" / "sessions" / f"{SID}.json").write_text(
+        json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    box.fire(box.prompt("第二轮"))
+    check.check("no duplicate archive", len(box.layer("阅读层")), 1)
+    check.check("still marked as a real completion",
+                "recovered: false" in box.read("阅读层/" + box.layer("阅读层")[0]), True)
+    check.check("no duplicate ledger line",
+                [r["turn_status"] for r in box.ledger()], ["completed"])
+
+
 SCENARIOS = (
     ("a_pending_question", a_pending_question),
     ("b_finished_turn", b_finished_turn),
@@ -442,6 +509,9 @@ SCENARIOS = (
     ("j2_no_false_recovery", j2_no_false_recovery),
     ("j3_recovery_tolerates_metadata", j3_recovery_tolerates_metadata),
     ("k_hostile", k_hostile),
+    ("l_stop_event_wins_over_a_lagging_log", l_stop_event_wins_over_a_lagging_log),
+    ("m_user_interruption_is_not_an_answer", m_user_interruption_is_not_an_answer),
+    ("n_no_double_processing", n_no_double_processing),
 )
 
 

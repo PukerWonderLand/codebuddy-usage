@@ -843,6 +843,31 @@ def unanswered_tool(entries: list[dict[str, Any]]) -> str:
 TURN_TAIL_TYPES = ("message", "function_call", "function_call_result", "reasoning")
 
 
+def turn_tail(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The last entry of the turn that says anything about where it stopped."""
+    for entry in reversed(entries):
+        if entry.get("type") in TURN_TAIL_TYPES:
+            return entry
+    return None
+
+
+def turn_interrupted(entries: list[dict[str, Any]]) -> bool:
+    """Whether the user cut this turn off (Esc / ctrl-C).
+
+    CodeBuddy marks the message it was streaming as ``status: "incomplete"`` with
+    the text "Interrupted by user", and a Stop hook still fires for such a turn —
+    so without this check an interruption gets archived as if its 19-byte
+    placeholder were the answer.
+    """
+    tail = turn_tail(entries)
+    return bool(
+        tail
+        and tail.get("type") == "message"
+        and tail.get("role") == "assistant"
+        and str(tail.get("status") or "") == "incomplete"
+    )
+
+
 def turn_completed(entries: list[dict[str, Any]]) -> bool:
     """Whether the turn in ``entries`` had finished, judged from the log alone.
 
@@ -861,17 +886,14 @@ def turn_completed(entries: list[dict[str, Any]]) -> bool:
     """
     if unanswered_tool(entries):
         return False
-    for entry in reversed(entries):
-        kind = entry.get("type")
-        if kind not in TURN_TAIL_TYPES:
-            continue
-        return (
-            kind == "message"
-            and entry.get("role") == "assistant"
-            and str(entry.get("status") or "") == "completed"
-            and bool(assistant_text(entry))
-        )
-    return False
+    tail = turn_tail(entries)
+    return bool(
+        tail
+        and tail.get("type") == "message"
+        and tail.get("role") == "assistant"
+        and str(tail.get("status") or "") == "completed"
+        and bool(assistant_text(tail))
+    )
 
 
 def pending_tool_arguments(transcript_path: Any, tool_name: str) -> dict[str, Any] | None:
@@ -1159,7 +1181,14 @@ def handle_stop(
     analysis = analyze_transcript(transcript_path)
     if not prompt:
         prompt = analysis["prompt"]
-    answer = analysis["answer"] or str(event.get("last_assistant_message") or "")
+    # The Stop event carries the CLI's own final output ("last_assistant_message",
+    # built from the in-memory run result), so prefer it: the session log can lag
+    # the Stop event by a beat, and a transcript-only read then records the
+    # previous mid-turn segment instead of the answer — which is exactly how a
+    # 7.5 KB answer once got archived as a 184-byte "先确认两处细节" note. The
+    # transcript remains the fallback, and the only source for catch-up/recovery,
+    # where no event field exists.
+    answer = str(event.get("last_assistant_message") or "") or analysis["answer"]
     model = analysis["model"] or str(event.get("model", ""))
     event["model"] = model
     current = analysis["cumulative"]
@@ -1186,22 +1215,28 @@ def handle_stop(
     # judged from the log instead: if the turn did finish and only its Stop went
     # missing, the archive is repaired now (recovered); if it was interrupted or
     # still has a call in flight, it must not be archived at all.
+    entries = current_turn_entries(transcript_path)
     turn_status = "completed"
-    if origin != "stop":
-        entries = current_turn_entries(transcript_path)
-        if turn_completed(entries):
-            turn_status = "recovered"
-        elif unanswered_tool(entries) == ASK_USER_QUESTION_TOOL:
-            turn_status = "interrupted_pending_question"
-        else:
-            turn_status = "superseded_catchup"
+    if origin == "stop":
+        if turn_interrupted(entries):
+            turn_status = "interrupted_by_user"
+    elif turn_completed(entries):
+        turn_status = "recovered"
+    elif unanswered_tool(entries) == ASK_USER_QUESTION_TOOL:
+        turn_status = "interrupted_pending_question"
+    else:
+        turn_status = "superseded_catchup"
 
     # ---- archive ----------------------------------------------------------- #
     # Only a finished turn may write to the archive: a real Stop, or a completed
-    # turn whose Stop was lost. Anything else stays in the audit mirror, and the
-    # ledger below still accounts for its tokens.
+    # turn whose Stop was lost. An interrupted turn does not qualify — its only
+    # text is the "Interrupted by user" placeholder, and whoever interrupted it
+    # was at the terminal anyway. Anything unarchived stays in the audit mirror,
+    # and the ledger below still accounts for its tokens.
     archive_status = "未归档"
-    if origin != "stop" and turn_status != "recovered":
+    if turn_status in ("interrupted_by_user", "interrupted_pending_question"):
+        archive_status = f"未归档（{turn_status}，仅记账）"
+    elif origin != "stop" and turn_status != "recovered":
         archive_status = f"未归档（回合未真正结束：{turn_status}，仅记账）"
     elif answer:
         try:
@@ -1218,7 +1253,7 @@ def handle_stop(
             )
             archive_status = f"已归档 → {relative}"
         except Exception as exc:  # noqa: BLE001 - archive failures are non-fatal
-            archive_status = f"归档失败（本地已保留，下次自动重试）：{exc!r}"
+            archive_status = f"归档失败（仅记账，需手动补）：{exc!r}"
             log_error("Stop-archive", session_id, turn_id, exc)
     else:
         archive_status = "未归档（会话日志中未找到最终回答）"
@@ -1304,9 +1339,13 @@ def main() -> int:
     try:
         if hook == "UserPromptSubmit":
             session_record = load_json(session_path(session_id)) or {}
-            # A fresh prompt supersedes any turn whose Stop was skipped.
+            # A fresh prompt supersedes any turn whose Stop was skipped. When the
+            # Stop and the prompt land in the same instant the session record may
+            # still name a turn the Stop already recorded — processing it again
+            # would rewrite the same document as "recovered" and double the ledger.
             pending = str(session_record.get("current_turn_id") or "")
-            if pending:
+            reported = session_record.get("reported_turns")
+            if pending and not (isinstance(reported, list) and pending in reported):
                 try:
                     handle_stop(event, session_id, pending, origin="catchup")
                 except Exception as exc:  # noqa: BLE001
