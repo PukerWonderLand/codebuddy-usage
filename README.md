@@ -143,11 +143,26 @@ cleaned up when the turn ends, so "the file exists" means "it is still waiting".
 Because a panel's text reaches the log a fraction of a second after the panel
 itself, the signal is written immediately and enriched with the text ~1.2s later.
 
-Only turns that truly finish are written into `阅读层`. A turn interrupted with
-Esc, superseded before its question was answered, or stranded on a tool call or
-tool result is recorded in the ledger and the audit layer only — never as
-half-finished Markdown mid-conversation; the ledger marks it
-`interrupted_pending_question` or `superseded_catchup`.
+Only turns that truly finish are written into `阅读层`. `turn_status` in the
+ledger names the rest:
+
+| turn_status | Meaning | Archived |
+| :--- | :--- | :--- |
+| `completed` | a real `Stop` | yes |
+| `recovered` | the turn did finish, but its `Stop` never arrived; repaired from the log at the next prompt | yes (`recovered: true`) |
+| `interrupted_by_user` | you pressed Esc / Ctrl-C; the turn's only text is the 19-byte `Interrupted by user` placeholder | no |
+| `interrupted_pending_question` | a question panel was left unanswered and the topic changed | no |
+| `superseded_catchup` | the turn was still running (a tool call in flight, or stranded on a tool result) when the next prompt arrived | no |
+
+So a half-finished answer never lands on the share mid-conversation, and a
+placeholder is never archived as if it were the answer.
+
+> **The session log lags the `Stop` event.** When the hook runs, the log may not
+> contain the final message yet (measured: ~300 ms late), and reading only the log
+> records the mid-turn narration instead — a 7,522-byte answer was archived as
+> 184 bytes this way. The answer therefore comes from the Stop event's own
+> `last_assistant_message` (built from the in-memory run result), with the log as
+> the fallback and as the source for recovery.
 
 Conversely, when a turn *did* finish but its `Stop` event never arrived (process
 killed, hook removed), the next prompt repairs it from the log:

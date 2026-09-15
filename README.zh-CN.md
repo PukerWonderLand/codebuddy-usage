@@ -118,9 +118,21 @@ journalctl --user -u codebuddy-dashboard -f
 这些文件在**你回应后立即删除**（`PreToolUse` 触发），回合结束时也会清理，因此"文件存在"就等于"它还在等你"。
 参数细节：提问/计划面板的正文比面板晚约 0.3 秒落盘，所以信号会先写一版、约 1.2 秒后自动补全正文。
 
-只有**真正结束**的回合才会写入 `阅读层`。中途被打断的回合（Esc 打断流式输出、面板未答就换话题、回合停在工具调用或工具结果上）只进账本与审计层，绝不在对话中间落半截 Markdown；账本里的 `turn_status` 会标注为 `interrupted_pending_question` 或 `superseded_catchup`。
+只有**真正结束**的回合才会写入 `阅读层`。账本里的 `turn_status` 会把其余情况标清楚：
+
+| turn_status | 含义 | 是否写归档 |
+| :--- | :--- | :--- |
+| `completed` | 真 `Stop`，正常结束 | ✅ |
+| `recovered` | 回合确实结束了，但 Stop 事件没送到（进程被杀、hook 被摘），由下一条提示词从日志补回 | ✅（frontmatter 标 `recovered: true`） |
+| `interrupted_by_user` | 你按 Esc / Ctrl-C 打断；该轮最后一条只有 19 字节的 `Interrupted by user` 占位符 | ❌ 仅记账 |
+| `interrupted_pending_question` | 提问面板没回答就换了话题 | ❌ 仅记账 |
+| `superseded_catchup` | 回合还在进行（有工具调用在飞、或停在工具结果上）就被下一条提示词取代 | ❌ 仅记账 |
+
+也就是说：**绝不在对话中间落半截 Markdown**，也不会把"Interrupted by user"这种占位符当成回答收进归档。
 
 反过来，**回合真的结束、但 `Stop` 事件没送到**（进程被杀、hook 被摘）时，下一条提示词到来会从日志把它补回：`turn_status: recovered`，归档 frontmatter 标 `recovered: true`。判据取自日志本身——该轮所有工具调用都有结果、结尾是一条 `status: completed` 的最终回答；被用户打断的消息日志标的是 `status: incomplete`，因此不会被误当成回答收进去。
+
+> 一个容易踩的坑：**会话日志的落盘滞后于 `Stop` 事件**。hook 运行的那一刻，日志里可能还没有最后那条回答（实测差约 300ms），只读日志会把中间的旁白当成回答（曾把 7522 字节的回答归档成 184 字节）。所以回答优先取 Stop 事件自带的 `last_assistant_message`（来自内存里的运行结果），日志只作兜底与补回。
 
 ### 关于「Harness 组装（重建）」
 

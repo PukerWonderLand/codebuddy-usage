@@ -103,8 +103,17 @@ Then trigger an `AskUserQuestion` panel and confirm the "waiting on you" signal:
 
 Note that the readable layer only receives turns that actually finished: a real
 `Stop`, or a completed turn whose `Stop` was lost (repaired at the next prompt as
-`turn_status: recovered`). A turn superseded mid-flight is recorded in the ledger
-and in `审计层` only.
+`turn_status: recovered`). Everything else stays in the ledger and `审计层`:
+`interrupted_by_user` (Esc), `interrupted_pending_question`, `superseded_catchup`.
+
+Two traps worth knowing when touching the answer extraction:
+
+- The session log **lags the `Stop` event** (measured ~300 ms), so a log-only read
+  records the mid-turn narration as the answer. Use the event's
+  `last_assistant_message`; keep the log as fallback and for recovery.
+- `Stop` **does** fire on a user interruption, with the turn's last text being the
+  19-byte `Interrupted by user` placeholder and `status: incomplete` — check that
+  status or the interruption gets archived as an answer.
 
 Verify the ledger grew:
 
