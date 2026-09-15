@@ -101,8 +101,10 @@ Then trigger an `AskUserQuestion` panel and confirm the "waiting on you" signal:
 `<archive_root>/<date>/<...>/_等待回答.md` must appear the moment the panel opens
 (with the question text and options), and disappear once the answer is submitted.
 
-Note that only a real `Stop` writes into `阅读层`; a turn superseded by the next
-prompt is recorded in the ledger and in `审计层` only.
+Note that the readable layer only receives turns that actually finished: a real
+`Stop`, or a completed turn whose `Stop` was lost (repaired at the next prompt as
+`turn_status: recovered`). A turn superseded mid-flight is recorded in the ledger
+and in `审计层` only.
 
 Verify the ledger grew:
 

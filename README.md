@@ -144,9 +144,17 @@ Because a panel's text reaches the log a fraction of a second after the panel
 itself, the signal is written immediately and enriched with the text ~1.2s later.
 
 Only turns that truly finish are written into `阅读层`. A turn interrupted with
-Esc, superseded before its question was answered, or killed is recorded in the
-ledger and the audit layer only — never as half-finished Markdown mid-conversation;
-the ledger marks it `interrupted_pending_question` or `superseded_catchup`.
+Esc, superseded before its question was answered, or stranded on a tool call or
+tool result is recorded in the ledger and the audit layer only — never as
+half-finished Markdown mid-conversation; the ledger marks it
+`interrupted_pending_question` or `superseded_catchup`.
+
+Conversely, when a turn *did* finish but its `Stop` event never arrived (process
+killed, hook removed), the next prompt repairs it from the log:
+`turn_status: recovered`, with `recovered: true` in the front matter. The
+evidence is taken from the log itself — every tool call in the turn has a result
+and the turn ends on a `status: completed` answer — so a stream the user cut off
+(marked `status: incomplete`) is never mistaken for an answer.
 
 ### About the "Harness assembly (reconstructed)" section
 

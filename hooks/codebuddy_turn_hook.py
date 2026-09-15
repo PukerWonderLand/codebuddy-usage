@@ -9,10 +9,11 @@ One deterministic, model-free script handles three CodeBuddy hook events:
 * Stop             -> combine the spooled prompt with the final assistant
   answer, write a verbatim Markdown document to the archive root (often an SMB
   share), mirror the raw session JSONL into an audit layer, append a token-usage
-  ledger record, and emit a "turn end" system message. Only a real Stop may
-  write to the archive: when the next prompt supersedes a turn whose Stop was
-  skipped, the turn is accounted but NOT archived, so a half-finished answer
-  never lands on the share mid-conversation.
+  ledger record, and emit a "turn end" system message. Only a FINISHED turn may
+  write to the archive, and a catch-up call judges that from the log: a turn that
+  finished but whose Stop was lost is repaired (`recovered: true`), while a turn
+  superseded mid-flight is accounted but never archived, so a half-finished
+  answer cannot land on the share.
 * Notification     -> publish a "_等待回答.md" / "_等待输入.md" signal in the
   session folder while somebody is needed.
 
@@ -606,6 +607,7 @@ def markdown_document(
     session_record: dict[str, Any],
     answer: str,
     harness: str = "",
+    recovered: bool = False,
 ) -> bytes:
     created_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
     header = (
@@ -622,10 +624,18 @@ def markdown_document(
         f"assistant_answer_sha256: {sha256_text(answer)}\n"
         "archive_mode: verbatim\n"
         f"harness_section: {'reconstructed' if harness else 'absent'}\n"
+        f"recovered: {'true' if recovered else 'false'}\n"
         "---\n\n"
         "# CodeBuddy 对话归档\n\n"
-        "## 用户原文\n\n"
     )
+    if recovered:
+        header += (
+            "> ⚠️ 本轮的 `Stop` hook 没有触发（进程被杀、hook 缺失等），"
+            "此归档是下一条提示词到来时从会话日志补回的（`recovered: true`）。\n"
+            "> 判据来自日志本身：该轮所有工具调用都有结果，结尾是一条 `status: completed` 的"
+            "最终回答；被用户打断的消息日志里标的是 `status: incomplete`，不会被误收。\n\n"
+        )
+    header += "## 用户原文\n\n"
     middle = "\n\n## CodeBuddy 最终回答\n\n"
     # The prompt and answer payloads are inserted unchanged; the harness section
     # (when present) is clearly marked as a reconstruction, not verbatim.
@@ -714,6 +724,7 @@ def write_archive(
     prompt: str,
     answer: str,
     harness: str = "",
+    recovered: bool = False,
 ) -> str:
     """Write the Markdown + audit mirror. Returns the archive-relative path."""
     folder = session_dir(session_record, session_id)
@@ -725,7 +736,10 @@ def write_archive(
     with lock_path.open("a+b") as lock:
         exclusive_lock(lock)
         atomic_write_bytes(
-            turn_file, markdown_document(event, prompt, session_record, answer, harness)
+            turn_file,
+            markdown_document(
+                event, prompt, session_record, answer, harness, recovered
+            ),
         )
         mirror_transcript(event.get("transcript_path"), audit_file)
     return str(turn_file)
@@ -782,15 +796,11 @@ def render_questions(tool_input: Any) -> str:
     return "（问题正文尚未落盘，约 2 秒后本文件会自动补全；也可直接到终端查看）"
 
 
-def pending_tool_arguments(transcript_path: Any, tool_name: str) -> dict[str, Any] | None:
-    """Arguments of the newest ``tool_name`` call that still has no result.
+def current_turn_entries(transcript_path: Any) -> list[dict[str, Any]]:
+    """Entries belonging to the newest turn, i.e. after the last real prompt.
 
-    This is the only reliable "that panel is on screen right now" marker:
-    CodeBuddy appends the function_call entry the moment the panel opens and the
-    function_call_result entry only once the human has answered, so an
-    unanswered call is visible on disk while every hook event is still silent.
-    The scan is scoped to the current turn, so a call abandoned in an earlier
-    turn cannot haunt the session.
+    Scoping everything to the current turn is what stops an abandoned question or
+    a stale tool call from an earlier turn haunting the session.
     """
     entries = iter_entries(transcript_path)
     start = 0
@@ -801,19 +811,80 @@ def pending_tool_arguments(transcript_path: Any, tool_name: str) -> dict[str, An
             and user_prompt_text(entry)
         ):
             start = index + 1
-    calls: list[tuple[str, Any]] = []
+    return entries[start:]
+
+
+def called_tools(entries: list[dict[str, Any]]) -> tuple[list[tuple[str, str, Any]], set[str]]:
+    """(call_id, tool_name, arguments) in order, plus the ids that have a result."""
+    calls: list[tuple[str, str, Any]] = []
     answered: set[str] = set()
-    for entry in entries[start:]:
+    for entry in entries:
         call_id = str(entry.get("callId") or "")
         if not call_id:
             continue
         if entry.get("type") == "function_call":
-            if entry.get("name") == tool_name:
-                calls.append((call_id, entry.get("arguments")))
+            calls.append((call_id, str(entry.get("name") or ""), entry.get("arguments")))
         elif entry.get("type") == "function_call_result":
             answered.add(call_id)
-    for call_id, arguments in reversed(calls):
-        if call_id in answered:
+    return calls, answered
+
+
+def unanswered_tool(entries: list[dict[str, Any]]) -> str:
+    """Name of the newest tool call with no result, or "" when all are answered."""
+    calls, answered = called_tools(entries)
+    for call_id, name, _ in reversed(calls):
+        if call_id not in answered:
+            return name
+    return ""
+
+
+# Entry types that say something about where a turn stopped. Metadata entries
+# (ai-title, file-history-snapshot, ...) are skipped when looking at the tail.
+TURN_TAIL_TYPES = ("message", "function_call", "function_call_result", "reasoning")
+
+
+def turn_completed(entries: list[dict[str, Any]]) -> bool:
+    """Whether the turn in ``entries`` had finished, judged from the log alone.
+
+    Needed because a Stop event can be lost (process killed, hook removed) while
+    the turn itself completed. Codex marks its final answers with
+    ``phase: final_answer``; CodeBuddy has no such field, but it does mark a
+    message that was cut off by the user with ``status: "incomplete"`` (text
+    "Interrupted by user"), so the closest equivalent is:
+
+    * every tool call in the turn has a result (nothing is in flight),
+    * the last content entry is an assistant message with output text, and
+    * that message is ``status: "completed"`` rather than ``"incomplete"``.
+
+    Anything else — an in-flight call, a turn ending on a tool result, a stream
+    the user cut off — counts as unfinished and is never archived.
+    """
+    if unanswered_tool(entries):
+        return False
+    for entry in reversed(entries):
+        kind = entry.get("type")
+        if kind not in TURN_TAIL_TYPES:
+            continue
+        return (
+            kind == "message"
+            and entry.get("role") == "assistant"
+            and str(entry.get("status") or "") == "completed"
+            and bool(assistant_text(entry))
+        )
+    return False
+
+
+def pending_tool_arguments(transcript_path: Any, tool_name: str) -> dict[str, Any] | None:
+    """Arguments of the newest ``tool_name`` call in the turn that has no result.
+
+    This is the only reliable "that panel is on screen right now" marker:
+    CodeBuddy appends the function_call entry the moment the panel opens and the
+    function_call_result entry only once the human has answered, so an
+    unanswered call is visible on disk while every hook event is still silent.
+    """
+    calls, answered = called_tools(current_turn_entries(transcript_path))
+    for call_id, name, arguments in reversed(calls):
+        if name != tool_name or call_id in answered:
             continue
         if isinstance(arguments, str):
             try:
@@ -1111,29 +1182,39 @@ def handle_stop(
 
     # ---- how did the turn end? --------------------------------------------- #
     # A real Stop means the run reached its final output. A catch-up call (the
-    # next UserPromptSubmit superseding a turn whose Stop was skipped) does not,
-    # and an unanswered AskUserQuestion is the usual reason Stop never fired.
+    # next UserPromptSubmit superseding a turn whose Stop was skipped) has to be
+    # judged from the log instead: if the turn did finish and only its Stop went
+    # missing, the archive is repaired now (recovered); if it was interrupted or
+    # still has a call in flight, it must not be archived at all.
     turn_status = "completed"
     if origin != "stop":
-        turn_status = (
-            "interrupted_pending_question"
-            if pending_tool_arguments(transcript_path, ASK_USER_QUESTION_TOOL) is not None
-            else "superseded_catchup"
-        )
+        entries = current_turn_entries(transcript_path)
+        if turn_completed(entries):
+            turn_status = "recovered"
+        elif unanswered_tool(entries) == ASK_USER_QUESTION_TOOL:
+            turn_status = "interrupted_pending_question"
+        else:
+            turn_status = "superseded_catchup"
 
     # ---- archive ----------------------------------------------------------- #
-    # Only a real Stop may write to the archive. A catch-up means the turn never
-    # ended, so a reading-layer document would put a half-finished answer on the
-    # share mid-conversation. Those turns stay in the audit mirror, and the
-    # ledger below still accounts for their tokens.
+    # Only a finished turn may write to the archive: a real Stop, or a completed
+    # turn whose Stop was lost. Anything else stays in the audit mirror, and the
+    # ledger below still accounts for its tokens.
     archive_status = "未归档"
-    if origin != "stop":
+    if origin != "stop" and turn_status != "recovered":
         archive_status = f"未归档（回合未真正结束：{turn_status}，仅记账）"
     elif answer:
         try:
             harness = harness_section(event, analysis.get("entries", []), current)
             relative = write_archive(
-                event, session_id, turn_id, session_record, prompt, answer, harness
+                event,
+                session_id,
+                turn_id,
+                session_record,
+                prompt,
+                answer,
+                harness,
+                recovered=turn_status == "recovered",
             )
             archive_status = f"已归档 → {relative}"
         except Exception as exc:  # noqa: BLE001 - archive failures are non-fatal
