@@ -88,7 +88,9 @@ with open(path, encoding="utf-8") as fh:
     data = json.load(fh)
 hooks = data.get("hooks")
 if isinstance(hooks, dict):
-    for event in ("UserPromptSubmit", "Stop"):
+    # Every event we might have registered, discovered rather than hardcoded so
+    # the list cannot go stale as the hook grows more entry points.
+    for event in list(hooks):
         groups = hooks.get(event)
         if not isinstance(groups, list):
             continue

@@ -47,7 +47,11 @@ Useful flags: `--dry-run`, `--copy`, `--no-hooks`, `--no-service`.
 # a) Python files compile
 python3 -m py_compile hooks/codebuddy_turn_hook.py src/*.py && echo COMPILE_OK
 
-# b) The service is up and listening
+# b) Hook regression suite (pure stdlib, sandboxed in a temp dir — safe to run
+#    on a live machine; it never touches the real archive or ledger)
+python3 tests/test_turn_hook.py
+
+# c) The service is up and listening
 ss -ltn | grep 3766            # Linux
 lsof -nP -iTCP:3766 -sTCP:LISTEN   # macOS
 # Linux service state:
@@ -55,40 +59,50 @@ systemctl --user status codebuddy-dashboard --no-pager | head -5
 # macOS service state:
 launchctl print "gui/$(id -u)/com.pukerwonderland.codebuddy-dashboard" | head -20
 
-# c) APIs answer
+# d) APIs answer
 curl -s http://127.0.0.1:3766/api/health
 curl -s "http://127.0.0.1:3766/api/summary?range=all" | head -c 400
 
-# d) The page and assets load
+# e) The page and assets load
 for p in / /app.js /style.css; do
   curl -s -o /dev/null -w "$p %{http_code}\n" http://127.0.0.1:3766$p
 done
 
-# e) The hook is registered exactly once per event
+# f) The hook is registered exactly once per event
 python3 - <<'PY'
 import json, os
 p = os.path.expanduser("~/.codebuddy/settings.json")
 d = json.load(open(p, encoding="utf-8"))
-for ev in ("UserPromptSubmit", "Stop"):
+for ev in ("UserPromptSubmit", "Stop", "PreToolUse", "Notification"):
     n = sum("codebuddy_turn_hook.py" in str(h.get("command",""))
             for g in d.get("hooks", {}).get(ev, []) for h in g.get("hooks", []))
     print(ev, "entries:", n)
 PY
 
-# f) Collector totals are self-consistent
+# g) Collector totals are self-consistent
 codebuddy-dashboard summary
 ```
 
 `/api/health` must return `{"ok": true, ...}`. Each static route must return
-`200` (favicon `204`). Hook entries must print `1` for both events.
+`200` (favicon `204`). Hook entries must print `1` for all four events. The
+regression suite must end with `all N checks passed`.
 
 ## 4. Activate the hooks
 
-CodeBuddy snapshots hooks at startup. **Restart the CodeBuddy CLI** (or open the
-`/hooks` menu to review/apply). After the next conversation turn:
+CodeBuddy snapshots hooks at startup **and hot-reloads `settings.json` when it
+changes**, so a running session picks the new events up on the next change.
+**Restart the CodeBuddy CLI** (or open the `/hooks` menu to review/apply) if in
+doubt. After the next conversation turn:
 
 - the UI shows a `▶ 本轮开始` and a `■ 本轮结束` message, and
 - a new `*.md` appears under `<archive_root>/<date>/<...>/阅读层/`.
+
+Then trigger an `AskUserQuestion` panel and confirm the "waiting on you" signal:
+`<archive_root>/<date>/<...>/_等待回答.md` must appear the moment the panel opens
+(with the question text and options), and disappear once the answer is submitted.
+
+Note that only a real `Stop` writes into `阅读层`; a turn superseded by the next
+prompt is recorded in the ledger and in `审计层` only.
 
 Verify the ledger grew:
 

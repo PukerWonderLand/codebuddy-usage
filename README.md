@@ -19,6 +19,13 @@ It is the CodeBuddy counterpart of
   atomic writes.
 - **Turn start/end token accounting**: `UserPromptSubmit` records a baseline,
   `Stop` computes the turn delta and session total and surfaces them in the UI.
+- **"It is waiting on you" signals**: when CodeBuddy opens a question or
+  plan-approval panel, or sits idle mid-turn, a `_等待回答.md` / `_等待批准.md` /
+  `_等待输入.md` file appears in the session archive folder with the question text
+  and options. It is written the instant the panel opens and removed as soon as
+  you respond, so you can see it without looking at the terminal. Only turns that
+  truly finish produce an archive document; interrupted turns are accounted in
+  the ledger but never archived mid-conversation.
 - **Full history backfill**: parses `~/.codebuddy/projects/**/*.jsonl` directly,
   so all existing sessions are included from the first start.
 - **Zero dependencies**: Python 3.10+ only. No Node, no database, no network.
@@ -52,7 +59,9 @@ removes unrelated hooks or settings in `~/.codebuddy/settings.json`.
 2. Writes/merges `~/.codebuddy-usage/config.json`.
 3. Symlinks `codebuddy-usage` and `codebuddy-dashboard` into `~/.local/bin`, and
    the hook into `~/.codebuddy/hooks/codebuddy_turn_hook.py`.
-4. Registers the `UserPromptSubmit` / `Stop` hooks in
+4. Registers the `UserPromptSubmit` / `Stop` hooks, plus matcher-scoped
+   `PreToolUse` (retiring a panel signal) and `Notification`
+   (`permission_prompt` / `idle_prompt` signals) hooks in
    `~/.codebuddy/settings.json` (backs up first; never duplicates).
 5. Installs and starts the systemd **user** service
    `codebuddy-dashboard.service` on `0.0.0.0:3766`, and enables linger when
@@ -114,8 +123,30 @@ The config file lives at `~/.codebuddy-usage/config.json` (relocatable via
 ```
 <archive_root>/<date>/<title>__<session8>/
 ├── 阅读层/<turn-id>.md     # prompt + rebuilt Harness section + final answer
-└── 审计层/<session-id>.jsonl   # raw session log mirror
+├── 审计层/<session-id>.jsonl   # raw session log mirror
+└── _等待回答.md            # "waiting on you" signal, see below
 ```
+
+### Waiting-on-you signals (`_等待回答.md` / `_等待批准.md` / `_等待输入.md`)
+
+When CodeBuddy stops and waits for a human, one transient file appears in the
+session folder — never more than one at a time:
+
+| File | Triggered by | Content |
+| :--- | :--- | :--- |
+| `_等待回答.md` | the instant an `AskUserQuestion` panel opens | question, every option, raw tool call |
+| `_等待批准.md` | the instant an `ExitPlanMode` panel opens | the plan text |
+| `_等待输入.md` | a turn still open but quiet for 60s (catch-all) | note that the session is waiting |
+
+The file is **removed the moment you respond** (via `PreToolUse`) and also
+cleaned up when the turn ends, so "the file exists" means "it is still waiting".
+Because a panel's text reaches the log a fraction of a second after the panel
+itself, the signal is written immediately and enriched with the text ~1.2s later.
+
+Only turns that truly finish are written into `阅读层`. A turn interrupted with
+Esc, superseded before its question was answered, or killed is recorded in the
+ledger and the audit layer only — never as half-finished Markdown mid-conversation;
+the ledger marks it `interrupted_pending_question` or `superseded_catchup`.
 
 ### About the "Harness assembly (reconstructed)" section
 

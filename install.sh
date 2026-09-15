@@ -181,34 +181,53 @@ if not isinstance(hooks, dict):
     data["hooks"] = hooks
 
 changed = False
-for event in ("UserPromptSubmit", "Stop"):
+# event, matcher (None = match everything), timeout in ms
+SPEC = (
+    ("UserPromptSubmit", None, 120),
+    ("Stop", None, 120),
+    # AskUserQuestion / ExitPlanMode panels always block on a human, and the
+    # permission_prompt notification is the only event that fires while they are
+    # open; PreToolUse fires right after the human responds and retires the signal.
+    ("PreToolUse", "AskUserQuestion|ExitPlanMode", 10),
+    ("Notification", "permission_prompt|idle_prompt", 10),
+)
+for event, matcher, timeout in SPEC:
     groups = hooks.get(event)
     if not isinstance(groups, list):
         groups = []
         hooks[event] = groups
     # Identify our entry by script name, not the full command, so an interpreter
     # path change updates in place instead of adding a duplicate.
-    found = False
+    target = None
     for group in groups:
         if not isinstance(group, dict):
             continue
         for hook in group.get("hooks", []):
             if isinstance(hook, dict) and "codebuddy_turn_hook.py" in str(hook.get("command", "")):
-                if hook.get("command") != command:
-                    hook["command"] = command
-                    changed = True
-                found = True
+                target = (group, hook)
                 break
-        if found:
+        if target:
             break
-    if not found:
-        groups.append(
-            {
-                "hooks": [
-                    {"type": "command", "command": command, "timeout": 120}
-                ]
-            }
-        )
+    if target:
+        group, hook = target
+        if hook.get("command") != command:
+            hook["command"] = command
+            changed = True
+        if hook.get("timeout") != timeout:
+            hook["timeout"] = timeout
+            changed = True
+        if matcher is None:
+            if "matcher" in group:
+                group.pop("matcher")
+                changed = True
+        elif group.get("matcher") != matcher:
+            group["matcher"] = matcher
+            changed = True
+    else:
+        entry = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+        if matcher is not None:
+            entry["matcher"] = matcher
+        groups.append(entry)
         changed = True
 
 if changed:

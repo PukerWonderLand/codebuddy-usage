@@ -1,14 +1,42 @@
 #!/usr/bin/env python3
-"""CodeBuddy turn hook: archive the turn as Markdown and account token usage.
+"""CodeBuddy turn hook: archive the turn as Markdown, account tokens, and signal
+the moments when the CLI is blocked waiting on a human.
 
-One deterministic, model-free script handles two CodeBuddy hook events:
+One deterministic, model-free script handles three CodeBuddy hook events:
 
 * UserPromptSubmit -> spool the exact user prompt, snapshot cumulative token
   usage as the turn baseline, emit a "turn start" system message.
 * Stop             -> combine the spooled prompt with the final assistant
   answer, write a verbatim Markdown document to the archive root (often an SMB
   share), mirror the raw session JSONL into an audit layer, append a token-usage
-  ledger record, and emit a "turn end" system message.
+  ledger record, and emit a "turn end" system message. Only a real Stop may
+  write to the archive: when the next prompt supersedes a turn whose Stop was
+  skipped, the turn is accounted but NOT archived, so a half-finished answer
+  never lands on the share mid-conversation.
+* Notification     -> publish a "_等待回答.md" / "_等待输入.md" signal in the
+  session folder while somebody is needed.
+
+What actually fires when, measured on this machine (see the notes below, they
+are not obvious from the docs):
+
+* Stop hooks are SKIPPED while a question is pending — AskUserQuestion is
+  delivered as an interruption, and interruptions abort the Stop path. So a
+  pending question is invisible to UserPromptSubmit/Stop.
+* ``permission_prompt`` fires the instant the AskUserQuestion panel opens, with
+  the message "needs your permission to use AskUserQuestion". This is the only
+  zero-latency trigger, and for a bypass-permissions session it does not fire for
+  auto-approved tools.
+* ``idle_prompt`` does NOT fire while a question is pending: the session is not
+  considered idle. It only covers an in-progress turn that has gone quiet.
+* PreToolUse for AskUserQuestion is useless here: it runs when the tool executes,
+  i.e. after the human has already answered.
+
+The question text itself is not in the notification, and the tool call reaches
+the transcript a fraction of a second after the panel opens, so the signal is
+published immediately and then upgraded once the transcript catches up.
+
+Both signal files are transient: they exist exactly while the CLI waits on a
+human, and are removed on the next UserPromptSubmit or Stop.
 
 Every stage is isolated: a failed archive or a missing transcript never blocks
 the conversation. Errors are appended to STATE_ROOT/errors.log.
@@ -30,6 +58,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 from typing import Any
 
 
@@ -79,6 +108,30 @@ NON_PROMPT_PREFIXES = (
     "<command-message",
     "<local-command-stdout",
 )
+
+# Transient "a human is needed right now" signals, written into the session
+# folder next to 阅读层/审计层 so they surface on the Windows share as well.
+PENDING_QUESTION_FILE = "_等待回答.md"
+PLAN_APPROVAL_FILE = "_等待批准.md"
+WAITING_INPUT_FILE = "_等待输入.md"
+SIGNAL_FILES = (PENDING_QUESTION_FILE, PLAN_APPROVAL_FILE, WAITING_INPUT_FILE)
+
+# The notification that announces a panel names the tool in its text:
+# "needs your permission to use AskUserQuestion".
+PERMISSION_MESSAGE_MARKER = "needs your permission to use "
+ASK_USER_QUESTION_TOOL = "AskUserQuestion"
+
+# Tools whose dialog always blocks until a human responds. Everything else can
+# be auto-approved, so it must never raise a signal on its own.
+SIGNAL_FILE_FOR_TOOL = {
+    ASK_USER_QUESTION_TOOL: PENDING_QUESTION_FILE,
+    "ExitPlanMode": PLAN_APPROVAL_FILE,
+}
+
+# The tool call lands in the transcript a fraction of a second after the panel
+# opens, so the trigger publishes a bare signal and then waits this long before
+# trying to fill in the question or plan text.
+SIGNAL_ENRICH_DELAY = 1.2
 
 
 # --------------------------------------------------------------------------- #
@@ -631,6 +684,28 @@ def mirror_transcript(transcript_path: Any, destination: Path) -> None:
             tmp_path.unlink()
 
 
+def session_dir(session_record: dict[str, Any], session_id: str) -> Path:
+    date = safe_id(session_record.get("date"), "unknown-date")
+    folder_name = str(
+        session_record.get("folder_name") or f"未命名对话__{session_id[:8]}"
+    )
+    return ARCHIVE_ROOT / date / folder_name
+
+
+def titled_session_dir(
+    session_record: dict[str, Any], session_id: str
+) -> Path | None:
+    """Session folder for signal files, or None if the session has no title yet.
+
+    Signals must never materialise a bogus ``未命名对话__``folder, so they are
+    simply dropped for untitled sessions.
+    """
+    folder_name = session_record.get("folder_name")
+    if not isinstance(folder_name, str) or not folder_name.strip():
+        return None
+    return session_dir(session_record, session_id)
+
+
 def write_archive(
     event: dict[str, Any],
     session_id: str,
@@ -641,11 +716,9 @@ def write_archive(
     harness: str = "",
 ) -> str:
     """Write the Markdown + audit mirror. Returns the archive-relative path."""
-    date = safe_id(session_record.get("date"), "unknown-date")
-    folder_name = str(session_record.get("folder_name", f"未命名对话__{session_id[:8]}"))
-    session_dir = ARCHIVE_ROOT / date / folder_name
-    turn_file = session_dir / "阅读层" / f"{turn_id}.md"
-    audit_file = session_dir / "审计层" / f"{session_id}.jsonl"
+    folder = session_dir(session_record, session_id)
+    turn_file = folder / "阅读层" / f"{turn_id}.md"
+    audit_file = folder / "审计层" / f"{session_id}.jsonl"
 
     lock_path = STATE_ROOT / "locks" / f"{session_id}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -656,6 +729,299 @@ def write_archive(
         )
         mirror_transcript(event.get("transcript_path"), audit_file)
     return str(turn_file)
+
+
+# --------------------------------------------------------------------------- #
+# "A human is needed" signals
+# --------------------------------------------------------------------------- #
+def remove_signal(folder: Path, name: str) -> None:
+    try:
+        (folder / name).unlink()
+    except OSError:
+        pass
+
+
+def clear_signals(session_record: dict[str, Any], session_id: str) -> None:
+    """Drop every signal: the CLI is no longer waiting on a human."""
+    folder = titled_session_dir(session_record, session_id)
+    if folder is None:
+        return
+    for name in SIGNAL_FILES:
+        remove_signal(folder, name)
+
+
+def render_questions(tool_input: Any) -> str:
+    questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
+    out: list[str] = []
+    if isinstance(questions, list):
+        for index, item in enumerate(questions, 1):
+            if not isinstance(item, dict):
+                continue
+            header = str(item.get("header") or "").strip() or "未命名问题"
+            text = str(item.get("question") or "").strip() or "（无题干）"
+            kind = "多选" if item.get("multiSelect") else "单选"
+            out.append(f"### {index}. {header}（{kind}）")
+            out.append("")
+            out.append(text)
+            out.append("")
+            options = item.get("options")
+            if isinstance(options, list):
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    label = str(option.get("label") or "").strip()
+                    description = str(option.get("description") or "").strip()
+                    out.append(
+                        f"- **{label or '（无标签）'}**"
+                        + (f" — {description}" if description else "")
+                    )
+                out.append("")
+        return "\n".join(out).strip() or "（questions 数组为空）"
+    if isinstance(tool_input, dict) and tool_input.get("_raw"):
+        return "（无法解析为 JSON，原文见下方）"
+    return "（问题正文尚未落盘，约 2 秒后本文件会自动补全；也可直接到终端查看）"
+
+
+def pending_tool_arguments(transcript_path: Any, tool_name: str) -> dict[str, Any] | None:
+    """Arguments of the newest ``tool_name`` call that still has no result.
+
+    This is the only reliable "that panel is on screen right now" marker:
+    CodeBuddy appends the function_call entry the moment the panel opens and the
+    function_call_result entry only once the human has answered, so an
+    unanswered call is visible on disk while every hook event is still silent.
+    The scan is scoped to the current turn, so a call abandoned in an earlier
+    turn cannot haunt the session.
+    """
+    entries = iter_entries(transcript_path)
+    start = 0
+    for index, entry in enumerate(entries):
+        if (
+            entry.get("type") == "message"
+            and entry.get("role") == "user"
+            and user_prompt_text(entry)
+        ):
+            start = index + 1
+    calls: list[tuple[str, Any]] = []
+    answered: set[str] = set()
+    for entry in entries[start:]:
+        call_id = str(entry.get("callId") or "")
+        if not call_id:
+            continue
+        if entry.get("type") == "function_call":
+            if entry.get("name") == tool_name:
+                calls.append((call_id, entry.get("arguments")))
+        elif entry.get("type") == "function_call_result":
+            answered.add(call_id)
+    for call_id, arguments in reversed(calls):
+        if call_id in answered:
+            continue
+        if isinstance(arguments, str):
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+            return {"_raw": arguments}
+        return {"_raw": json.dumps(arguments, ensure_ascii=False)}
+    return None
+
+
+def signal_document(
+    event: dict[str, Any],
+    session_record: dict[str, Any],
+    session_id: str,
+    kind: str,
+    body_parts: list[str],
+) -> bytes:
+    created_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    header = (
+        "---\n"
+        f"signalled_at: {json.dumps(created_at, ensure_ascii=False)}\n"
+        f"session_id: {json.dumps(session_id, ensure_ascii=False)}\n"
+        f"turn_id: {json.dumps(str(session_record.get('current_turn_id') or ''), ensure_ascii=False)}\n"
+        f"archive_title: {json.dumps(str(session_record.get('title', '')), ensure_ascii=False)}\n"
+        f"cwd: {json.dumps(str(event.get('cwd', '')), ensure_ascii=False)}\n"
+        f"notification_message: {json.dumps(str(event.get('message', '')), ensure_ascii=False)}\n"
+        f"signal: {kind}\n"
+        "---\n\n"
+    )
+    return (header + "\n".join(body_parts) + "\n").encode("utf-8")
+
+
+def publish_signal(
+    event: dict[str, Any],
+    session_record: dict[str, Any],
+    session_id: str,
+    filename: str,
+    kind: str,
+    body_parts: list[str],
+) -> None:
+    """Publish one signal and retire the others: at most one may ever exist."""
+    folder = titled_session_dir(session_record, session_id)
+    if folder is None:
+        return
+    try:
+        atomic_write_bytes(
+            folder / filename,
+            signal_document(event, session_record, session_id, kind, body_parts),
+        )
+        for other in SIGNAL_FILES:
+            if other != filename:
+                remove_signal(folder, other)
+    except OSError as exc:
+        log_error(f"signal-{kind}", session_id, "", exc)
+
+
+def write_answer_needed(
+    event: dict[str, Any],
+    session_record: dict[str, Any],
+    session_id: str,
+    tool_input: dict[str, Any],
+) -> None:
+    """Signal an unanswered AskUserQuestion, with the question text when known."""
+    body = [
+        "# ⏸ 等待你回答",
+        "",
+        "> CodeBuddy 弹出了提问面板（`AskUserQuestion`），正在等你选择。",
+        "> 该信号在面板弹出时立即写入；你回答后（或回合结束时）自动删除。",
+        "> **只要这个文件还在，就说明这个问题还没被回答。**",
+        "",
+        "## 问题",
+        "",
+        render_questions(tool_input),
+        "",
+        "## 工具调用原文",
+        "",
+        "```json",
+        json.dumps(tool_input, ensure_ascii=False, indent=2),
+        "```",
+    ]
+    publish_signal(
+        event, session_record, session_id, PENDING_QUESTION_FILE, "pending_question", body
+    )
+
+
+def write_plan_approval_needed(
+    event: dict[str, Any],
+    session_record: dict[str, Any],
+    session_id: str,
+    tool_input: dict[str, Any],
+) -> None:
+    """Signal an ExitPlanMode approval dialog, with the plan text when known."""
+    raw_plan = tool_input.get("plan") if isinstance(tool_input, dict) else None
+    plan = raw_plan.strip() if isinstance(raw_plan, str) else ""
+    body = [
+        "# ⏸ 等待你批准计划",
+        "",
+        "> CodeBuddy 请求退出计划模式（`ExitPlanMode`），正在等你批准后开始动手。",
+        "> 该信号在面板弹出时立即写入；你批准后（或回合结束时）自动删除。",
+        "",
+        "## 计划",
+        "",
+        plan or render_questions(tool_input),
+        "",
+        "## 工具调用原文",
+        "",
+        "```json",
+        json.dumps(tool_input, ensure_ascii=False, indent=2),
+        "```",
+    ]
+    publish_signal(
+        event, session_record, session_id, PLAN_APPROVAL_FILE, "plan_approval", body
+    )
+
+
+def write_waiting_input(
+    event: dict[str, Any], session_record: dict[str, Any], session_id: str
+) -> None:
+    """Catch-all signal for 'a turn is open and idle 60s'."""
+    body = [
+        "# ⏸ 等待你输入",
+        "",
+        "> 会话已空闲 60 秒，CodeBuddy 侧没有待执行的动作，但本轮尚未结束。",
+        "> 也可能是一条尚未落盘的提问，稍后会被更精确的信号文件取代。",
+        "",
+    ]
+    publish_signal(
+        event, session_record, session_id, WAITING_INPUT_FILE, "idle_prompt", body
+    )
+
+
+def handle_idle(event: dict[str, Any], session_id: str) -> None:
+    """Notification(idle_prompt): an in-progress turn has gone quiet.
+
+    Note that this never fires while a question panel is open, so it is only a
+    safety net for the other ways a turn can stall.
+    """
+    session_record = load_json(session_path(session_id)) or {}
+    if titled_session_dir(session_record, session_id) is None:
+        return
+    if not str(session_record.get("current_turn_id") or ""):
+        # The turn already ended: the CLI is only waiting for the next prompt,
+        # which is the normal state and must not generate files.
+        return
+    question = pending_tool_arguments(event.get("transcript_path"), ASK_USER_QUESTION_TOOL)
+    if question is not None:
+        # Should not happen (a pending question suppresses idle_prompt), but if a
+        # build ever does emit it, prefer the precise signal.
+        write_answer_needed(event, session_record, session_id, question)
+        return
+    write_waiting_input(event, session_record, session_id)
+
+
+def permission_tool(message: Any) -> str:
+    """Extract the tool name from a permission_prompt notification message."""
+    text = str(message or "")
+    if PERMISSION_MESSAGE_MARKER not in text:
+        return ""
+    return text.split(PERMISSION_MESSAGE_MARKER, 1)[1].strip()
+
+
+def retire_signal(session_id: str, tool_name: str) -> None:
+    """Retire the signal of a dialog that has just been answered.
+
+    PreToolUse runs when the tool finally executes, i.e. right after the human
+    responded. Retiring here keeps the promise honest — the file exists only
+    while the question is genuinely unanswered, even if the turn then carries on
+    for a long time.
+    """
+    filename = SIGNAL_FILE_FOR_TOOL.get(tool_name)
+    if filename is None:
+        return
+    session_record = load_json(session_path(session_id)) or {}
+    folder = titled_session_dir(session_record, session_id)
+    if folder is not None:
+        remove_signal(folder, filename)
+
+
+def handle_human_input_prompt(event: dict[str, Any], session_id: str, tool_name: str) -> None:
+    """Notification(permission_prompt) naming a tool that always blocks on a human.
+
+    This is the only zero-latency trigger: the question/plan panel is already up
+    when it arrives. The tool call itself reaches the transcript a moment later,
+    so publish a usable signal right away and upgrade it with the text once it
+    lands.
+    """
+    session_record = load_json(session_path(session_id)) or {}
+    if titled_session_dir(session_record, session_id) is None:
+        return
+    write = (
+        write_answer_needed
+        if tool_name == ASK_USER_QUESTION_TOOL
+        else write_plan_approval_needed
+    )
+    tool_input = pending_tool_arguments(event.get("transcript_path"), tool_name)
+    if tool_input is not None:
+        write(event, session_record, session_id, tool_input)
+        return
+    write(event, session_record, session_id, {})
+    time.sleep(SIGNAL_ENRICH_DELAY)
+    if not str(session_record.get("current_turn_id") or ""):
+        return  # The turn ended while we waited; the signal was already cleaned.
+    tool_input = pending_tool_arguments(event.get("transcript_path"), tool_name)
+    if tool_input is not None:
+        write(event, session_record, session_id, tool_input)
 
 
 # --------------------------------------------------------------------------- #
@@ -682,6 +1048,8 @@ def handle_user_prompt(
     baseline = cumulative_usage(event.get("transcript_path"))
     session_record["baseline"] = baseline
     atomic_write_json(session_path(session_id), session_record)
+    # The human just typed something, so nothing is waiting on them any more.
+    clear_signals(session_record, session_id)
 
     atomic_write_json(
         prompt_path(session_id, turn_id),
@@ -707,7 +1075,9 @@ def handle_user_prompt(
     )
 
 
-def handle_stop(event: dict[str, Any], session_id: str, turn_id: str) -> str:
+def handle_stop(
+    event: dict[str, Any], session_id: str, turn_id: str, origin: str = "stop"
+) -> str:
     event["turn_id"] = turn_id
     transcript_path = event.get("transcript_path")
     spooled = load_json(prompt_path(session_id, turn_id)) or {}
@@ -739,9 +1109,27 @@ def handle_stop(event: dict[str, Any], session_id: str, turn_id: str) -> str:
         reported = []
     already_reported = turn_id in reported
 
+    # ---- how did the turn end? --------------------------------------------- #
+    # A real Stop means the run reached its final output. A catch-up call (the
+    # next UserPromptSubmit superseding a turn whose Stop was skipped) does not,
+    # and an unanswered AskUserQuestion is the usual reason Stop never fired.
+    turn_status = "completed"
+    if origin != "stop":
+        turn_status = (
+            "interrupted_pending_question"
+            if pending_tool_arguments(transcript_path, ASK_USER_QUESTION_TOOL) is not None
+            else "superseded_catchup"
+        )
+
     # ---- archive ----------------------------------------------------------- #
+    # Only a real Stop may write to the archive. A catch-up means the turn never
+    # ended, so a reading-layer document would put a half-finished answer on the
+    # share mid-conversation. Those turns stay in the audit mirror, and the
+    # ledger below still accounts for their tokens.
     archive_status = "未归档"
-    if answer:
+    if origin != "stop":
+        archive_status = f"未归档（回合未真正结束：{turn_status}，仅记账）"
+    elif answer:
         try:
             harness = harness_section(event, analysis.get("entries", []), current)
             relative = write_archive(
@@ -767,6 +1155,7 @@ def handle_stop(event: dict[str, Any], session_id: str, turn_id: str) -> str:
             "cumulative": current,
             "cumulative_cache_hit_rate": round(hit_rate(current), 1),
             "archive": archive_status,
+            "turn_status": turn_status,
         }
         try:
             append_line_locked(
@@ -781,6 +1170,7 @@ def handle_stop(event: dict[str, Any], session_id: str, turn_id: str) -> str:
 
     session_record["current_turn_id"] = ""
     atomic_write_json(session_path(session_id), session_record)
+    clear_signals(session_record, session_id)
 
     return (
         "■ 本轮结束 | 本轮：输入 {tin}（缓存命中 {tin_rate:.0f}%）· 输出 {tout}"
@@ -837,7 +1227,7 @@ def main() -> int:
             pending = str(session_record.get("current_turn_id") or "")
             if pending:
                 try:
-                    handle_stop(event, session_id, pending)
+                    handle_stop(event, session_id, pending, origin="catchup")
                 except Exception as exc:  # noqa: BLE001
                     log_error("catch-up", session_id, pending, exc)
             turn_id = new_turn_id()
@@ -856,6 +1246,17 @@ def main() -> int:
                 return 0
             message = handle_stop(event, session_id, turn_id)
             emit({"systemMessage": message})
+        elif hook == "PreToolUse":
+            # Runs when the tool executes, i.e. right after the human responded.
+            retire_signal(session_id, str(event.get("tool_name") or ""))
+        elif hook == "Notification":
+            notification_type = str(event.get("notification_type") or "")
+            if notification_type == "idle_prompt":
+                handle_idle(event, session_id)
+            elif notification_type == "permission_prompt":
+                tool = permission_tool(event.get("message"))
+                if tool in SIGNAL_FILE_FOR_TOOL:
+                    handle_human_input_prompt(event, session_id, tool)
     except Exception as exc:  # noqa: BLE001 - never block the conversation
         log_error(str(hook), session_id, str(event.get("turn_id", "")), exc)
     return 0

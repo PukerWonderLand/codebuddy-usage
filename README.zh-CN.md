@@ -11,6 +11,9 @@
 - **局域网网页仪表盘**：总 token、输入、缓存命中率、输出、推理、计费、会话数；按日趋势、按模型/项目分布、会话与轮次明细、归档记录。
 - **对话归档**：每轮结束把「用户提问 + 最终回答」以 verbatim Markdown 写入归档目录（常见做法是挂到 Windows 的 SMB 共享），并镜像原始会话 JSONL 作为审计层；带 SHA-256 与原子写入。
 - **开始/结束 token 计数**：`UserPromptSubmit` 记录基线，`Stop` 计算本轮增量与会话累计，并在界面提示。
+- **“正在等你”信号**：CodeBuddy 弹出提问/计划批准面板或长时间停在等你输入时，在会话归档目录写入
+  `_等待回答.md` / `_等待批准.md` / `_等待输入.md`（内容含题干与选项）。这些文件在面板弹出瞬间生成、你回应后自动删除，
+  用于在看不到终端时也能知道它在等你。只有真正结束的回合才会写入归档 md，中途被打断的回合仅记账、不落归档正文。
 - **历史回溯**：直接解析 `~/.codebuddy/projects/**/*.jsonl`，安装后立即包含全部历史会话，无需从零开始。
 - **零依赖**：只需要 Python 3.10+；不需要 Node、数据库或网络。
 
@@ -41,7 +44,7 @@ cd codebuddy-usage
 1. 校验 `python3 >= 3.10`。
 2. 写入/合并配置 `~/.codebuddy-usage/config.json`。
 3. 把 `codebuddy-usage`、`codebuddy-dashboard` 链接到 `~/.local/bin`，把 hook 链接到 `~/.codebuddy/hooks/codebuddy_turn_hook.py`。
-4. 在 `~/.codebuddy/settings.json` 中注册 `UserPromptSubmit` / `Stop` 两个 hook（先备份，重复执行不会产生重复项）。
+4. 在 `~/.codebuddy/settings.json` 中注册 `UserPromptSubmit` / `Stop`，以及带 matcher 的 `PreToolUse`（提问/计划面板的收回）与 `Notification`（`permission_prompt` / `idle_prompt` 信号）hook（先备份，重复执行不会产生重复项）。
 5. 安装并启动 systemd **用户服务** `codebuddy-dashboard.service`，绑定 `0.0.0.0:3766`；可用时同时开启 linger（免登录开机自启）。
 
 > 重启 CodeBuddy 后 hook 才会生效（CodeBuddy 在启动时快照 hooks 配置）。
@@ -98,8 +101,24 @@ journalctl --user -u codebuddy-dashboard -f
 ```
 <archive_root>/<日期>/<标题>__<会话前8位>/
 ├── 阅读层/<轮次ID>.md     # 用户原文 + Harness 组装(重建) + 最终回答
-└── 审计层/<会话ID>.jsonl   # 原始会话日志镜像
+├── 审计层/<会话ID>.jsonl   # 原始会话日志镜像
+└── _等待回答.md            # 见下方「等待信号」（仅在有人需要回应时存在）
 ```
+
+### 等待信号（`_等待回答.md` / `_等待批准.md` / `_等待输入.md`）
+
+当 CodeBuddy 停下来等人时，会在会话目录里出现一个临时文件，**同一时刻最多只有一个**：
+
+| 文件 | 触发 | 内容 |
+| :--- | :--- | :--- |
+| `_等待回答.md` | `AskUserQuestion` 面板弹出的瞬间 | 题干 + 全部选项 + 原始工具调用 |
+| `_等待批准.md` | `ExitPlanMode` 计划批准面板弹出的瞬间 | 计划正文 |
+| `_等待输入.md` | 回合尚未结束、空闲 60 秒（兜底） | 说明会话在等你 |
+
+这些文件在**你回应后立即删除**（`PreToolUse` 触发），回合结束时也会清理，因此"文件存在"就等于"它还在等你"。
+参数细节：提问/计划面板的正文比面板晚约 0.3 秒落盘，所以信号会先写一版、约 1.2 秒后自动补全正文。
+
+只有**真正结束**的回合才会写入 `阅读层`。中途被打断（Esc、面板未答就换话题、进程被杀）的回合只进账本与审计层，不会在对话中间往归档盘写半截 Markdown；账本里的 `turn_status` 会标注为 `interrupted_pending_question` 或 `superseded_catchup`。
 
 ### 关于「Harness 组装（重建）」
 
@@ -140,7 +159,8 @@ codebuddy-usage/
 ├── bin/                          # 命令入口（解析自身真实路径，可软链）
 │   ├── codebuddy-usage
 │   └── codebuddy-dashboard
-├── hooks/codebuddy_turn_hook.py  # CodeBuddy hook：归档 + token 记账
+├── hooks/codebuddy_turn_hook.py  # CodeBuddy hook：归档 + token 记账 + 等待信号
+├── tests/test_turn_hook.py       # hook 回归测试（纯标准库，沙盒内运行，不碰真实归档）
 ├── src/
 │   ├── config.py                 # 可移植路径解析
 │   ├── collector.py              # 扫描会话日志，回溯全部历史
