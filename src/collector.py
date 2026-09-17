@@ -98,7 +98,8 @@ def _parse_file(path: Path) -> dict[str, Any]:
     session_id = path.stem
     project = path.parent.name
     cwd = ""
-    title = ""
+    ai_title = ""
+    custom_title = ""
     model = ""
     turn = 0
     seen: set[str] = set()
@@ -122,7 +123,9 @@ def _parse_file(path: Path) -> dict[str, Any]:
                 if item.get("cwd"):
                     cwd = str(item["cwd"])
                 if item.get("type") == "ai-title" and item.get("aiTitle"):
-                    title = str(item["aiTitle"])
+                    ai_title = str(item["aiTitle"])
+                elif item.get("type") == "custom-title" and item.get("customTitle"):
+                    custom_title = str(item["customTitle"])
                 if (
                     item.get("type") == "message"
                     and item.get("role") == "user"
@@ -173,7 +176,9 @@ def _parse_file(path: Path) -> dict[str, Any]:
         "session_id": session_id,
         "project": project,
         "cwd": cwd,
-        "title": title,
+        # A /rename is a deliberate act by the user, so it wins over the title the
+        # model generated for the conversation.
+        "title": custom_title or ai_title,
         "model": model,
         "events": events,
     }

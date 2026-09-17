@@ -127,6 +127,28 @@ The config file lives at `~/.codebuddy-usage/config.json` (relocatable via
 └── _等待回答.md            # "waiting on you" signal, see below
 ```
 
+### Session naming, renames and date folders
+
+- The folder is named after the session's **first prompt** (deterministic, no
+  model call, Windows-invalid characters sanitised).
+- After you `/rename` a session, **everything written from then on goes to a
+  folder named after the new name**; the old folder is left exactly as it was
+  (nothing is moved, so paths recorded for earlier turns keep working). The
+  original name is kept as `initial_title` in the state and as `archive_title` in
+  each document.
+  - The rename is read from the session log: a `custom-title` entry
+    (`customTitle`) and the `<local-command-stdout>Session renamed to: X</...>`
+    echo — the newest wins.
+  - Both carry a `sessionId`, and only entries **belonging to this session** are
+    accepted: a session forked out of an earlier conversation carries its
+    ancestor's log, and the ancestor's rename must not title the fork.
+- A **new session is filed under the day it first appeared**, so continuing it the
+  next morning does not produce a second folder of the same name in another date
+  directory. Sessions that already exist keep the previous per-turn behaviour —
+  no existing file is moved.
+- The **dashboard follows renames too**: a `custom-title` beats the model's
+  `ai-title`, because renaming is a deliberate act by you.
+
 ### Waiting-on-you signals (`_等待回答.md` / `_等待批准.md` / `_等待输入.md`)
 
 When CodeBuddy stops and waits for a human, one transient file appears in the

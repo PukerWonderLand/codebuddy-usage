@@ -115,6 +115,20 @@ Two traps worth knowing when touching the answer extraction:
   19-byte `Interrupted by user` placeholder and `status: incomplete` — check that
   status or the interruption gets archived as an answer.
 
+Session naming (verify after a rename):
+
+- The folder name comes from the first prompt. After a `/rename`, the next turn's
+  files must land in a **new** folder named after the new name
+  (`retitle_session()`), while the old folder keeps the earlier turns. The rename
+  is detected from `custom-title` entries and the
+  `Session renamed to: X` echo, filtered by `sessionId` so a forked session does
+  not inherit its ancestor's name.
+- New sessions are filed under their **first day** (`created_date`); records
+  without that field are older and keep the per-turn date.
+- `src/collector.py` prefers `custom-title` over `ai-title` for the dashboard, so
+  it needs a `systemctl --user restart codebuddy-dashboard` after any change
+  there.
+
 Verify the ledger grew:
 
 ```bash

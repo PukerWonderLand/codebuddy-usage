@@ -122,6 +122,9 @@ SIGNAL_FILES = (PENDING_QUESTION_FILE, PLAN_APPROVAL_FILE, WAITING_INPUT_FILE)
 PERMISSION_MESSAGE_MARKER = "needs your permission to use "
 ASK_USER_QUESTION_TOOL = "AskUserQuestion"
 
+# /rename leaves this echo in the session log next to the custom-title entry.
+RENAME_PATTERN = re.compile(r"Session renamed to:\s*(.+?)\s*(?:</|$)")
+
 # Tools whose dialog always blocks until a human responds. Everything else can
 # be auto-approved, so it must never raise a signal on its own.
 SIGNAL_FILE_FOR_TOOL = {
@@ -176,6 +179,72 @@ def folder_slug(title: str) -> str:
     value = re.sub(r"\s+", "_", value)
     value = re.sub(r"_+", "_", value).strip(" ._")
     return (value or "未命名对话")[:48]
+
+
+def renamed_session_title(entries: list[dict[str, Any]], session_id: str) -> str:
+    """The name the user gave this session with /rename, or "" if never renamed.
+
+    CodeBuddy records a rename twice, and both are read here: a ``custom-title``
+    entry carrying the new name, and a user message echoing
+    ``<local-command-stdout>Session renamed to: X``. The newest one wins.
+
+    Entries whose ``sessionId`` belongs to another session are skipped: a session
+    forked out of an earlier conversation carries that ancestor's log, and the
+    ancestor may have been renamed too.
+    """
+    title = ""
+    for entry in entries:
+        owner = str(entry.get("sessionId") or "")
+        if owner and owner != session_id:
+            continue
+        if str(entry.get("type") or "") == "custom-title":
+            candidate = str(entry.get("customTitle") or "").strip()
+            if candidate:
+                title = candidate
+        elif entry.get("type") == "message" and entry.get("role") == "user":
+            match = RENAME_PATTERN.search(_block_text(entry, {"input_text", "text"}))
+            if match:
+                title = match.group(1).strip()
+    return title
+
+
+def retitle_session(
+    session_record: dict[str, Any], session_id: str, entries: list[dict[str, Any]]
+) -> bool:
+    """Point the archive at the name the user last gave the session.
+
+    The folder that already holds earlier turns is left in place — renaming it
+    would invalidate paths recorded for those turns — so a rename simply starts a
+    new folder for everything written from now on, exactly as the user asked.
+    The first-prompt title is kept as ``initial_title`` so the old folder stays
+    traceable.
+    """
+    title = renamed_session_title(entries, session_id)
+    if not title or title == str(session_record.get("title") or ""):
+        return False
+    # Signals live inside the folder, and the run that follows only clears the new
+    # one — so the folder being left behind has to be cleared here or a stale
+    # "_等待回答.md" would sit there for good.
+    previous_dir = session_dir(session_record, session_id)
+    session_record.setdefault("initial_title", str(session_record.get("title") or ""))
+    session_record["title"] = title
+    session_record["title_source"] = "custom_title"
+    session_record["folder_name"] = f"{folder_slug(title)}__{session_id[:8]}"
+    for name in SIGNAL_FILES:
+        remove_signal(previous_dir, name)
+    return True
+
+
+def folder_date(session_record: dict[str, Any], fallback: str) -> str:
+    """Date directory to file this session under.
+
+    Sessions created from here on are pinned to the day they first appeared, so a
+    conversation continued the next morning stays in one folder instead of
+    appearing again under the same name in a second date directory. Records
+    without ``created_date`` predate that rule and keep the older per-turn
+    behaviour, so their existing folders are never split differently.
+    """
+    return str(session_record.get("created_date") or fallback)
 
 
 def atomic_write_bytes(path: Path, content: bytes) -> None:
@@ -254,6 +323,7 @@ def load_or_create_session(
     record = {
         "session_id": session_id,
         "date": date,
+        "created_date": date,
         "received_at": received_at,
         "title": title,
         "folder_name": f"{folder_slug(title)}__{session_id[:8]}",
@@ -1137,6 +1207,7 @@ def handle_user_prompt(
     date = now.date().isoformat()
 
     session_record = load_or_create_session(session_id, prompt, date, received_at)
+    session_record["date"] = folder_date(session_record, date)
     session_record["current_turn_id"] = turn_id
     baseline = cumulative_usage(event.get("transcript_path"))
     session_record["baseline"] = baseline
@@ -1196,7 +1267,11 @@ def handle_stop(
     session_record = load_json(session_path(session_id)) or load_or_create_session(
         session_id, prompt, date, received_at
     )
-    session_record["date"] = date
+    # A rename made since the last turn takes effect now: everything written from
+    # here on goes to a folder named after the new name, while the folder holding
+    # the earlier turns is left untouched.
+    retitle_session(session_record, session_id, analysis["entries"])
+    session_record["date"] = folder_date(session_record, date)
     session_record["received_at"] = received_at or session_record.get("received_at", "")
 
     # ---- token accounting -------------------------------------------------- #

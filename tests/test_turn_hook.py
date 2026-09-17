@@ -26,6 +26,7 @@ Usage:  python3 tests/test_turn_hook.py [--keep]
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import shutil
@@ -119,6 +120,28 @@ class Sandbox:
         folder = self.folder()
         target = folder / name if folder else None
         return sorted(p.name for p in target.iterdir()) if target and target.exists() else []
+
+    def date_dir(self) -> str:
+        """Date directory the hook files a new session under (today, local time)."""
+        return dt.datetime.now().astimezone().date().isoformat()
+
+    def state(self) -> dict:
+        path = self.root / "state" / "sessions" / f"{SID}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def write_state(self, record: dict) -> None:
+        path = self.root / "state" / "sessions" / f"{SID}.json"
+        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+
+    def set_spool_date(self, date: str) -> None:
+        """Backdate the pending turn, as an older build would have recorded it."""
+        for path in (self.root / "state" / "prompts" / SID).glob("*.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["date"] = date
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def date_dirs(self) -> list[str]:
+        return sorted(p.name for p in (self.root / "archive").iterdir() if p.is_dir())
 
     def read(self, relative: str) -> str:
         folder = self.folder()
@@ -412,6 +435,98 @@ def j3_recovery_tolerates_metadata(check: Checker, box: Sandbox) -> None:
     check.check("ledger status", box.ledger()[-1]["turn_status"], "recovered")
 
 
+def o_rename_moves_new_files_to_the_new_folder(check: Checker, box: Sandbox) -> None:
+    check.section("O. a /rename names the folder for everything written afterwards")
+    first = [user("我们先建立工程，从这个工程复制出去", 1),
+             assistant("好，先建立工程。", 2)]
+    box.write_transcript(first)
+    box.fire(box.prompt("我们先建立工程，从这个工程复制出去"))
+    box.fire(box.stop("好，先建立工程。"))
+    old_folder = box.folder()
+    check.check("first folder is named after the prompt",
+                old_folder is not None and "我们先建立工程" in old_folder.name, True)
+
+    # the user renames the session, then keeps working
+    stale = old_folder / "_等待回答.md"
+    stale.write_text("stale signal", encoding="utf-8")
+    box.append_transcript({"type": "custom-title", "customTitle": "FPGA设计推进-核心-2",
+                           "sessionId": SID, "id": "ct1", "timestamp": 2000})
+    box.append_transcript({"type": "message", "role": "user",
+                           "content": [{"type": "input_text",
+                                        "text": "<local-command-stdout>Session renamed to: FPGA设计推进-核心-2</local-command-stdout>"}],
+                           "sessionId": SID, "id": "rn1", "timestamp": 2001})
+    box.append_transcript(assistant("改名后的第一条回答。", 3))
+    box.fire(box.prompt("继续"))
+    box.fire(box.stop("改名后的第一条回答。"))
+
+    folders = sorted(p.name for p in (box.root / "archive" / box.date_dir()).iterdir()
+                     if p.is_dir())
+    check.check("a new folder carries the new name",
+                [f for f in folders if f.startswith("FPGA设计推进-核心-2")] != [], True)
+    check.check("the old folder is left alone",
+                [f for f in folders if f.startswith("我们先建立工程")] != [], True)
+    new_md = sorted((box.root / "archive" / box.date_dir()
+                     / [f for f in folders if f.startswith("FPGA设计推进")][0] / "阅读层").iterdir())
+    check.check("the new turn landed in the new folder", len(new_md), 1)
+    check.check("its frontmatter records the new name",
+                'archive_title: "FPGA设计推进-核心-2"' in new_md[0].read_text(encoding="utf-8"), True)
+    state = json.loads((box.root / "state" / "sessions" / f"{SID}.json").read_text(encoding="utf-8"))
+    check.check("state keeps the original as initial_title",
+                state.get("initial_title"), "我们先建立工程，从这个工程复制出去")
+    check.check("title_source", state.get("title_source"), "custom_title")
+    check.check("no signal left behind in the old folder", stale.exists(), False)
+
+
+def p_rename_of_a_forked_ancestor_is_ignored(check: Checker, box: Sandbox) -> None:
+    check.section("P. an ancestor's rename cannot title a forked session")
+    box.write_transcript([
+        user("我们先建立工程", 1), assistant("好。", 2),
+        # the ancestor's entries, which a fork carries along in its log
+        {"type": "custom-title", "customTitle": "祖先会话的名字",
+         "sessionId": "01a0a2ea-9f5b-7f88-b050-387bb18611bd", "id": "ct0", "timestamp": 1000},
+        {"type": "message", "role": "user",
+         "content": [{"type": "input_text",
+                      "text": "<local-command-stdout>Session renamed to: 祖先会话的名字</local-command-stdout>"}],
+         "sessionId": "01a0a2ea-9f5b-7f88-b050-387bb18611bd", "id": "rn0", "timestamp": 1001}])
+    box.fire(box.prompt("我们先建立工程"))
+    box.fire(box.stop("好。"))
+    folders = sorted(p.name for p in (box.root / "archive" / box.date_dir()).iterdir())
+    check.check("folder keeps the prompt name",
+                [f for f in folders if "祖先会话的名字" in f], [])
+    check.check("and uses the prompt title", [f for f in folders if "我们先建立工程" in f] != [], True)
+
+
+def q_session_date_is_pinned(check: Checker, box: Sandbox) -> None:
+    check.section("Q. a session is filed under the day it first appeared")
+    box.write_transcript([user("跨天会话", 1), assistant("第一天的回答。", 2)])
+    box.fire(box.prompt("跨天会话"))
+    box.fire(box.stop("第一天的回答。"))
+    check.check("record stores created_date", box.state().get("created_date"), box.date_dir())
+    check.check("one date directory", box.date_dirs(), [box.date_dir()])
+
+    # The same session is continued on a later day: the turn's own date is later,
+    # but the pinned folder keeps the session in one place.
+    box.write_transcript([user("跨天会话", 1), assistant("第一天的回答。", 2),
+                          assistant("第二天早上的回答。", 3)])
+    box.fire(box.prompt("第二天"))
+    box.set_spool_date("2099-01-01")
+    box.fire(box.stop("第二天早上的回答。"))
+    check.check("still one date directory", box.date_dirs(), [box.date_dir()])
+
+    # A record that predates the pin keeps the per-turn behaviour, so an existing
+    # session's new files are not silently moved to another day.
+    record = box.state()
+    record.pop("created_date", None)
+    box.write_state(record)
+    box.write_transcript([user("跨天会话", 1), assistant("第一天的回答。", 2),
+                          assistant("第三天早上的回答。", 4)])
+    box.fire(box.prompt("第三天"))
+    box.set_spool_date("2099-01-02")
+    box.fire(box.stop("第三天早上的回答。"))
+    check.check("legacy record follows the turn date",
+                box.date_dirs(), sorted([box.date_dir(), "2099-01-02"]))
+
+
 def k_hostile(check: Checker, box: Sandbox) -> None:
     check.section("K. hostile input never blocks the conversation")
     check.check("non-idle notification exit code", box.fire(box.notification("permission_prompt"))[0], 0)
@@ -512,6 +627,9 @@ SCENARIOS = (
     ("l_stop_event_wins_over_a_lagging_log", l_stop_event_wins_over_a_lagging_log),
     ("m_user_interruption_is_not_an_answer", m_user_interruption_is_not_an_answer),
     ("n_no_double_processing", n_no_double_processing),
+    ("o_rename_moves_new_files_to_the_new_folder", o_rename_moves_new_files_to_the_new_folder),
+    ("p_rename_of_a_forked_ancestor_is_ignored", p_rename_of_a_forked_ancestor_is_ignored),
+    ("q_session_date_is_pinned", q_session_date_is_pinned),
 )
 
 
